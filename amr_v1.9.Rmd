@@ -1,0 +1,1289 @@
+---
+title: "Reproducible code for: The rise of multidrug resistance in bacterial pathogens"
+author: "Johnson T.F."
+date: "2025-13-01"
+output:
+  pdf_document: default
+  word_document: default
+geometry: left=1cm,right=1cm,top=2cm,bottom=2cm
+classoption: portrait
+---
+
+**Workflow to estimate rates of AMR (anti-microbial resistance) and MDR (multi-drug resistance)**
+
+
+```{r setup, include=FALSE, warning=F, message = F, echo = F}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+knitr::opts_chunk$set(tidy.opts = list(width.cutoff = 60), tidy = TRUE)
+```
+
+First we load necessary R packages: [ape 5.7.1](https://cran.r-project.org/web/packages/ape/index.html), [phytools 1.5.1](https://cran.r-project.org/web/packages/phytools/index.html), [geosphere 1.5-18](https://cran.r-project.org/web/packages/geosphere/index.html), [dplyr 1.1.2](https://dplyr.tidyverse.org/), [tidyr 1.3.0](https://tidyr.tidyverse.org/), [ggplot2 3.4.4](https://ggplot2.tidyverse.org/), [sf 1.0-13](https://r-spatial.github.io/sf/), [rnaturalearth 0.3.4](https://cran.r-project.org/web/packages/rnaturalearth/vignettes/rnaturalearth.html), [biscale 1.0.0](https://cran.r-project.org/web/packages/biscale/index.html), [cowplot 1.1.1](https://cran.r-project.org/web/packages/cowplot/vignettes/introduction.html), [ggtree 3.6.2](https://bioconductor.org/packages/devel/bioc/vignettes/ggtree/inst/doc/ggtree.html), [brms 2.20.4](https://paul-buerkner.github.io/brms/#:~:text=The%20brms%20package%20provides%20an,interface%20for%20performing%20regression%20analyses.), [stringr 1.5.1](https://stringr.tidyverse.org/), [ggpubr 0.6.0](https://rpkgs.datanovia.com/ggpubr/), [countrycode 1.5.0](https://cran.r-project.org/web/packages/countrycode/index.html), [raster 3.6-23](https://cran.r-project.org/web/packages/raster/index.html), [sp 2.1-1](https://cran.r-project.org/web/packages/sp/index.html)
+
+
+After loading the R packages, we load two datasets (the records of resistance and a phylogeny at species level), and one function. We also introduce colour palettes for our figures. Generally, we use an increasing red palette to describe the relative multi-drug resistance. An increasing blue palette to depcit the change in resistance over time. 
+
+```{r load}
+
+library(phytools)
+library(ape)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(tidyverse)
+library(countrycode)
+library(geosphere)
+library(rstan)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(sf)
+library(biscale)
+library(cowplot)
+library(ggtree)
+library(stringr)
+library(raster)
+library(sp)
+library(ggdist)
+library(ggpubr)
+library(brms)
+library(marginaleffects)
+library(arrow)
+
+df_save = read_parquet("DATA_AMR_jul2023_ISO3_LAT_LON 2.parquet")
+tr_save = read.newick("species_level_tree (2).newick")
+
+norm_range <- function(x){
+  (x-min(x, na.rm = T))/(max(x, na.rm = T)-min(x, na.rm = T))
+}
+
+palette_hot = c("#f5f5f5", "#e6b6b6", "#d87676", "#c31f1f")
+palette_cold = c( "#f5f5f5", "#c6c6c6","#999999","#6e6e6e")
+palette_bi = c(
+  "1-1" = "#f5f5f5", # low x, low y
+  "2-1" = "#e6b6b6",
+  "3-1" = "#d87676", 
+  "4-1" = "#c31f1f", # high x, low y
+  "1-2" = "#c6c6c6",
+  "2-2" = "#ba9393",
+  "3-2" = "#ae5f5f",
+  "4-2" = "#9e1919",
+  "1-3" = "#999999",
+  "2-3" = "#907272", 
+  "3-3" = "#874949",
+  "4-3" = "#7a1414", 
+  "1-4" = "#6e6e6e",# low x, high y
+  "2-4" = "#675252",
+  "3-4" = "#613535",
+  "4-4" = "#570e0e"# high x, high y
+)
+
+
+```
+
+After loading the data, we impose a series of restrictions, removing any rows missing: coordinates, year, species name, and information on whether resistance was detected across the 13 categories. We also only keep species/countries with atleast 10 observations (rows). 
+
+```{r clean, warning=F, message = F}
+df =  df_save
+df = subset(df, !is.na(ISO.3)) #Remove all genomes with missing antibiotic information
+df = subset(df, !is.na(centroid_lon)) #Remove all genomes with missing coordinates
+df = subset(df, !is.na(centroid_lat))
+print(nrow(df))
+
+df = subset(df, !is.na(year)) #Remove all genomes with missing temporal information
+print(nrow(df))
+
+df = subset(df, !is.na(species)) #Remove all genomes with missing antibiotic information
+print(nrow(df))
+
+df = df[complete.cases(df[,c(9:21)]),] #Only keep complete cases
+print(nrow(df))
+
+geog_df = df %>%
+  group_by(ISO.3) %>%
+  summarise(N = n())
+head(geog_df[order(-geog_df$N),]) #Countries with the most observations
+
+world = ne_countries(scale = "medium", returnclass = "sf")
+geog_df = left_join(world, geog_df, by = c("iso_a3" = "ISO.3"))
+
+ggplot(data = geog_df) + #Plot observations over space
+  geom_sf(aes(fill = N)) +
+  scale_fill_gradient(name = "N", trans = "log10", breaks = c(1, 10, 100, 1000, 10000)) +
+  theme_classic()
+
+ggplot(data = geog_df) +  #Samples per capita over space
+  geom_sf(aes(fill = N/(pop_est/1000000))) +
+  scale_fill_gradient(name = "N/capita", trans = "log10", 
+                      breaks = c(0.1, 1, 10, 100, 1000), labels = c("0.1", "1", "10", "100", "1000")) +
+  theme_classic()
+
+geog_time_df = df %>%
+  group_by(ISO.3, year) %>%
+  summarise(N = n())
+ggplot(geog_time_df) + #Number of samples over time
+     geom_col(aes(x = year, y = N), colour = "grey80", fill = "grey80") +
+     labs(x = "", y = "N") +
+     theme_classic()
+geog_time_counts = data.frame(sort(table(geog_time_df$ISO.3)))
+length(geog_time_counts[which(geog_time_counts$Freq == 1),1]) #Countries with observations in only one year
+ggplot(geog_time_counts) + #Years of data per country
+  geom_density(aes(x = Freq)) +
+  labs(y = "Density (N)", x = "Years of data") +
+  theme_classic()
+
+geog_time_counts = left_join(world, geog_time_counts, by = c("iso_a3" = "Var1")) #Years of data over sapce
+ggplot(data = geog_time_counts) +
+  geom_sf(aes(fill = Freq)) +
+  scale_fill_continuous(name = "Years of data") +
+  theme_classic()
+
+
+df = df[df$ISO.3 %in% geog_time_counts[which(geog_time_counts$Freq > 9),]$iso_a3, ] #Only keep data where there are atleast two observations per country
+
+#Load environmental data
+anti = read.csv("data_anti.csv")
+anti$iso3 = countrycode(anti$country, "country.name", "iso3c")
+anti$country = NULL
+
+country_year_sum = df %>%
+  group_by(year, ISO.3) %>%
+  summarise(N = n())
+
+country_year_sum = left_join(country_year_sum, anti, by = c("ISO.3" = "iso3", "year" = "year"))
+
+ggplot(data = country_year_sum[which( #Plot number of samples by antibiotic use
+  country_year_sum$year == 2018),]) +
+  geom_point(aes(x = anti, y = N)) +
+  scale_y_log10() +
+  labs(x = "Antibiotic-use/capita", y = "N") +
+  theme_classic()
+
+ggplot(data = country_year_sum[which( #Plot number of samples by antibiotic use over different time periods
+  country_year_sum$year == 2018 |
+    country_year_sum$year == 2014 |
+    country_year_sum$year == 2010 |
+    country_year_sum$year == 2006),]) +
+  geom_point(aes(x = anti, y = N)) +
+  scale_y_log10() +
+  labs(x = "Antibiotic-use/capita", y = "N") +
+  theme_classic() +
+  facet_wrap(year~.)
+
+species_sum = df %>%
+  group_by(species) %>%
+  summarise(N = n())
+
+ggplot(species_sum) + #Number of samples per species
+  geom_col(aes(x = N, y = species)) +
+  scale_x_log10() +
+  labs(y = "", x = "N") +
+  theme_classic()
+
+species_year_sum = df %>%
+  group_by(species, year) %>%
+  summarise(N = n())
+species_year_sum = species_year_sum %>%
+  group_by(species) %>%
+  summarise(N = n())
+
+ggplot(species_year_sum) + #Number of years of data per species
+  geom_col(aes(x = N, y = species)) +
+  labs(y = "", x = "N") +
+  theme_classic() 
+
+df = df[df$species %in% species_year_sum[which(species_year_sum$N > 9),]$species, ] #
+
+max(df$year) # 2023
+df = subset(df, year > 1989)
+df$year = df$year - max(df$year) #Rescale the values to improve model run times
+colnames(df)[10] = "Betalactams"
+
+
+```
+
+Prior to modelling, we first must manipulate coordinates into a spatial covariance martix which specifies that neighbouring countires should have more similar rates of AMR. We use the Harvesine distances between country coordinate centroids. The Harvesine distnace acknowldges the curvature of the earth and calculates the number of meters between each country centorid. 
+
+We also account for phylogenetic structure, under the expectation that AMR will be more similar in closely related species. Our phylogeny required manipulation to force it into an ultrametric structure.
+
+For the modelling, we specify a multivariate mixed effect logistic regression, with 13 binary response variables, indicating signal of resistance (1) or not (0) to the following anti-microbials: Aminoglycosides, Betalactams, Polymyxins, Fosfomycin, Glycopeptides, Macrolides, Oxazolidinones, Phenicols, Quinolones, Rifampicin, Sulphonamides, Tetracyclines, Trimethoprim. We charecterise this resistance as a function of time (year fixed-effect). The data exhibits a hierarchical strucutre, which we capture by specifying correlated random intercepts and slopes for each baterial species and country. We also include two correlated effects: 1) specifying AMR in countries should covary according to pairwise distance from coordinate centroids; and 2) specifying AMR in bacteria should covary according to phylogenetic structure.
+
+
+```{r stan_data, warning=F, message = F}
+
+tr = tr_save
+df$species = gsub(" ", "_", df$species)
+df = df[df$species %in% tr$tip.label, ]
+
+
+df$space_id = df$ISO.3
+df$phylo_id = df$species
+df$uni_id = 1:nrow(df)
+
+# small sample 
+subsampledf = df 
+subsampledf = as.data.frame(subsampledf)
+subsampledf = subsampledf %>% na.omit
+
+
+GenerateMiniCov = function(df){
+  #Produce a spatial covariance matrix
+  spa_df = unique(df[,c("ISO.3", "centroid_lat", "centroid_lon")])
+  spa_mat_trim = as.matrix(distm(spa_df[,c(3,2)], fun = distHaversine))/1000000
+  # probably need kernel here 
+  spa_mat_trim = norm_range(spa_mat_trim)
+  spa_mat_trim = abs(spa_mat_trim - 1)
+  spa_id = spa_df$ISO.3
+  colnames(spa_mat_trim) = spa_id
+  rownames(spa_mat_trim) = spa_id
+  
+  # phylo
+  df = df[df$species %in% tr$tip.label, ]
+  tr_trim = keep.tip(tr, unique(df$species))
+  tr_trim_extend = phangorn::nnls.tree(cophenetic(tr_trim), tr_trim, rooted = TRUE) 
+  tr_trim_extend$edge.length = tr_trim_extend$edge.length + 0.001
+  phy_mat_trim = ape::vcv.phylo(tr_trim_extend, corr = T)
+  
+  # df
+  df$space_id = df$ISO.3
+  df$phylo_id = df$species
+  df$uni_id = 1:nrow(df)
+  
+  outlist=list(space=spa_mat_trim,phylo=phy_mat_trim,df=df)
+  return(outlist)
+}
+
+
+standata = GenerateMiniCov(subsampledf)
+
+```
+
+
+```{r stan_model, warning=F, message = F}
+
+#form =
+#  bf(mvbind(
+#    Aminoglycosides, 
+#    Betalactams, 
+#    Polymyxins, 
+#    Fosfomycin, 
+#    Glycopeptides, 
+#    Macrolides, 
+#    Oxazolidinones, 
+#    Phenicols, 
+#    Quinolones, 
+#    Rifampicin, 
+#    Sulphonamides,
+#    Tetracyclines,
+#    Trimethoprim) ~ 
+#      year + 
+#      (1 + year|ISO.3) +
+#      (1 + year|species) +
+#      (1|gr(space_id, cov = space)) +
+#      (1|gr(phylo_id, cov = phylo)) 
+#  )  + set_rescor(FALSE)
+
+
+#fit = brm(form, 
+#           data = standata$df, 
+#           data2 = list(space = standata$space, phylo = standata$phylo), 
+#           chains = 4, cores = 4, iter = 500, warmup = 250, thin = 1, refresh = 5,
+#           family = bernoulli)
+
+#saveRDS(fit, "non_multivar.rds")
+fit = readRDS("non_multivar.rds")
+summary(fit)
+```
+
+### Results
+
+```{r pp_check, fig.height=5, fig.width = 5, warning=F, message = F}
+
+ab_list = c(
+  "Aminoglycosides", 
+  "Betalactams", 
+  "Polymyxins", 
+  "Fosfomycin", 
+  "Glycopeptides", 
+  "Macrolides", 
+  "Oxazolidinones", 
+  "Phenicols", 
+  "Quinolones", 
+  "Rifampicin", 
+  "Sulphonamides",
+  "Tetracyclines",
+  "Trimethoprim")
+
+pp_list = list()
+for(a in ab_list){
+  pp_list[[a]] = pp_check(fit, resp = a) + 
+  theme_classic() +
+  labs(title = a)
+}
+
+draw_n = 1000
+tmp_df = data.frame(year = c(min(subsampledf$year): (0)))
+draw = posterior_linpred(fit, tmp_df, ndraws = draw_n, re.form = NA, transform = T)
+draw = matrix(draw, draw_n*34, 13)
+meta = expand.grid(draws = c(1:draw_n), year = c(1990:2023))
+draw = cbind(meta, draw)
+colnames(draw)[3:ncol(draw)] = ab_list
+draw_long = gather(draw, ab, prob, Aminoglycosides:Trimethoprim)
+
+
+ab_probs = draw_long %>%
+  group_by(ab, year) %>%
+  summarise(q0.025 = quantile(prob, probs = 0.025),
+            q0.05 = quantile(prob, probs = 0.05),
+            q0.1 = quantile(prob, probs = 0.1),
+            q0.25 = quantile(prob, probs = 0.25),
+            q0.5 = quantile(prob, probs = 0.5),
+            q0.75 = quantile(prob, probs = 0.75),
+            q0.9 = quantile(prob, probs = 0.9),
+            q0.95 = quantile(prob, probs = 0.95),
+            q0.975 = quantile(prob, probs = 0.975))
+
+```
+**Figure 1. Rise in anti-microbial resistance.** Change in resistance over time across 13 anti-microbials. Solid lines describe the median posterior prediction, averaged across all species and countries. Error bars describe the 50%, 80%, 90% and 95% credible intervals.
+
+
+
+```{r figure1, fig.height= 10, fig.width = 10, warning=F, message = F}
+#Culumative MDR
+
+
+breaks_fun <- function(x) {
+  if(max(x) > 0.8){
+    c(0.25, 0.5, 0.75)
+  } else if (max(x) > 0.6){
+    c(0.2, 0.4, 0.6)
+  } else if (max(x) > 0.5){
+    c(0.1, 0.3, 0.5)
+  } else if (max(x) > 0.45){
+    c(0.15, 0.3, 0.45)
+  } else if (max(x) > 0.4){
+    c(0.1, 0.25, 0.4)
+  } else if (max(x) > 0.35){
+    c(0.15, 0.25, 0.35)
+  } else if (max(x) > 0.3){
+    c(0.1, 0.2, 0.3)
+  } else if (max(x) > 0.1){
+    c(0.05, 0.1, 0.15)
+  } else if (max(x) > 0.05){
+    c(0.01, 0.03, 0.05)
+  } else if (max(x) > 0.04){
+    c(0.01, 0.025, 0.04)
+  } else if (max(x) > 0.03){
+    c(0.01, 0.02, 0.03)
+  } else if (max(x) > 0.025){
+    c(0.005, 0.015, 0.025)
+  } else if (max(x) > 0.0125){3
+    c(0.0025, 0.0075, 0.0125)
+  } else if (max(x) > 0.005){
+    c(0.001, 0.003, 0.005)
+  } else {
+    c(0.0005, 0.001, 0.0015)
+  }
+}
+
+fig1 = ggplot(ab_probs) +
+  geom_line(aes(x = as.numeric(year), y = q0.5), colour = "grey30") +
+  geom_ribbon(aes(x = as.numeric(year), ymin = q0.25, ymax = q0.75), fill = "grey30", alpha = 0.4) +
+  geom_ribbon(aes(x = as.numeric(year), ymin = q0.1, ymax = q0.9), fill = "grey30", alpha = 0.3) +
+  geom_ribbon(aes(x = as.numeric(year), ymin = q0.05, ymax = q0.95), fill = "grey30", alpha = 0.2) +
+  geom_ribbon(aes(x = as.numeric(year), ymin = q0.025, ymax = q0.975), fill = "grey30", alpha = 0.1) +
+  scale_x_continuous(breaks = c(1990, 2005, 2020), expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0), breaks = breaks_fun) +
+  facet_wrap(.~factor(ab, levels=c(
+    "Oxazolidinones", 
+    "Glycopeptides", 
+    "Rifampicin", 
+    "Quinolones", 
+    "Aminoglycosides", 
+    "Trimethoprim",
+    "Macrolides", 
+    "Fosfomycin", 
+    "Sulphonamides",
+    "Polymyxins", 
+    "Phenicols", 
+    "Tetracyclines",
+    "Betalactams")), scales = "free", ncol = 3) +
+  labs(x = "Year", y = "Probability of exhibiting resistance") +
+  theme_classic()
+
+fig1
+```
+
+**Figure 2. The arrival of multi-drug resistance.** Number of resistant anti-microbials (out of a maximum of 13) over time. Proportional distribution of resistance count (N) assessed over 2000 posterior samples.
+
+```{r figure2, fig.height=8, fig.width =12, warning=F, message = F}
+draw_n = 1000
+tmp_df = data.frame(year = c(min(subsampledf$year): (77)))
+draw = posterior_linpred(fit, tmp_df, ndraws = draw_n, re.form = NA, transform = T)
+draw = matrix(draw, draw_n*111, 13)
+meta = expand.grid(draws = c(1:draw_n), year = c(1990:2100))
+draw = cbind(meta, draw)
+colnames(draw)[3:ncol(draw)] = ab_list
+draw_long = gather(draw, ab, prob, Aminoglycosides:Trimethoprim)
+
+draw_long$bin = ifelse(draw_long$prob <= 0.5, 0, 1)
+
+overall_mdr = draw_long %>%
+  group_by(draws, year) %>%
+  summarise(sum = sum(bin))
+
+((399/326)*100)-100 #increase from 1990 to 2023 in 1 class
+((126/7)*100)-100 #increase from 1990 to 2023 in 2 class
+
+(17/1000)*100 #incidence of 3 classes
+(7/1000)*100
+(126/1000)*100
+
+fig2 = ggplot(overall_mdr) +
+  geom_col(aes(x = year, y = draws, fill = as.factor(sum)), width = 2, position = "fill") +
+  geom_vline(aes(xintercept = 2023), linetype = "dashed") +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0), breaks = c(0,0.25, 0.5, 0.75, 1)) +
+  scale_fill_manual(values = 
+                         scales::seq_gradient_pal("#f5f5f5", "#9e1919", "Lab")(seq(0,1,length.out=length(unique(overall_mdr$sum)))), name = "Resistance (N)") +
+  labs(x = "Year", y = "Distribution of resistance frequencies") +
+  theme_classic() +
+  theme(legend.position = "top") + 
+  guides(fill = guide_legend(nrow = 1))
+fig2
+```
+
+
+```{r figure3, fig.height = 11, fig.width = 9, warning=F, message = F}
+tmp_df = expand.grid(year = c(-33:0), ISO.3 = unique(subsampledf$ISO.3))
+tmp_df$space_id = tmp_df$ISO.3
+draw = posterior_linpred(fit, tmp_df, ndraws = draw_n, 
+                         re.form = ~(1 + year|ISO.3) + (1|gr(space_id, cov = space)), 
+                         transform = T)
+draw = matrix(draw, draw_n*nrow(tmp_df), 13)
+meta = expand.grid(draw = c(1:draw_n), year = c(1990:2023), ISO.3 = unique(subsampledf$ISO.3))
+draw = cbind(meta, draw)
+colnames(draw)[4:ncol(draw)] = ab_list
+draw_long = gather(draw, ab, prob, Aminoglycosides:Trimethoprim)
+country_sum = draw_long %>%
+  group_by(draw, year, ISO.3) %>%
+  summarise(cumsum = sum(prob))
+country_suma = subset(country_sum, year == 1990)
+country_sumb = subset(country_sum, year == 2023)
+country_sumb$diff = country_sumb$cumsum - country_suma$cumsum
+country_sum2 = country_sumb %>%
+  group_by(ISO.3) %>%
+  summarise(mn_diff = mean(diff), sd_diff = sd(diff), mn_2023 = mean(cumsum), sd_2023 = sd(cumsum))
+
+head(country_sum2[order(country_sum2$mn_2023, decreasing = TRUE), ]   )
+head(country_sum2[order(country_sum2$mn_2023, decreasing = FALSE), ]   )
+head(country_sum2[order(country_sum2$mn_diff, decreasing = TRUE), ]   )
+head(country_sum2[order(country_sum2$mn_diff, decreasing = FALSE), ]   )
+
+
+world_map = ne_countries(scale = "medium", returnclass = "sf")
+merged_data = merge(world_map, country_sum2, by.x = "iso_a3", by.y = "ISO.3")
+data = bi_class(merged_data, x = mn_2023, y = mn_diff, style = "quantile", dim = 4)
+
+
+map = ggplot() +
+  geom_sf(data = world_map, colour = "grey85", fill = NA) +
+  geom_sf(data = data, mapping = aes(fill = bi_class), color = "white", size = 0.1, show.legend = FALSE) +
+  bi_scale_fill(pal = palette_bi, dim = 4) +
+  bi_theme() +
+  theme(plot.title = element_text(size=12))
+
+legend = bi_legend(pal = palette_bi,
+                   dim = 4,
+                   xlab = "Resistance (N)",
+                   ylab = "Resistance \U0394\ ",
+                   size = 1)
+
+fig3a = ggdraw() +
+  draw_plot(map, 0, 0, 1, 1) +
+  draw_plot(legend, 0.1, 0.1, 0.35, 0.35)
+
+
+
+#Species level MDR now and change
+tmp_df = expand.grid(year = c(-33:0), species = unique(subsampledf$species))
+tmp_df$phylo_id = tmp_df$species
+draw = posterior_linpred(fit, tmp_df, ndraws = draw_n, 
+                         re.form = ~(1 + year|species) + (1|gr(phylo_id, cov = phylo)), 
+                         transform = T)
+draw = matrix(draw, draw_n*nrow(tmp_df), 13)
+meta = expand.grid(draw = c(1:draw_n), year = c(1990:2023), species = unique(subsampledf$species))
+draw = cbind(meta, draw)
+colnames(draw)[4:ncol(draw)] = ab_list
+draw_long = gather(draw, ab, prob, Aminoglycosides:Trimethoprim)
+species_sum = draw_long %>%
+  group_by(draw, year, species) %>%
+  summarise(cumsum = sum(prob))
+species_suma = subset(species_sum, year == 1990)
+species_sumb = subset(species_sum, year == 2023)
+species_sumb$diff = species_sumb$cumsum - species_suma$cumsum
+species_sum2 = species_sumb %>%
+  group_by(species) %>%
+  summarise(mn_diff = mean(diff), sd_diff = sd(diff), mn_2023 = mean(cumsum), sd_2023 = sd(cumsum))
+trend_phy = setNames(species_sum2$mn_diff, species_sum2$species)
+phytools::phylosig(tr, trend_phy, method = "lambda", test = T)
+
+status_phy = setNames(species_sum2$mn_2023, species_sum2$species)
+phytools::phylosig(tr, status_phy, method = "lambda", test = T)
+species_sum2 = bi_class(species_sum2, x = mn_2023, y = mn_diff, style = "quantile", dim = 4)[,c(1,6)]
+
+tr = tr_save
+tr_trim = keep.tip(tr, unique(subsampledf$species))
+
+colnames(species_sum2) = c("species", "A")
+species_sum2$species = gsub("_", " ", species_sum2$species)
+spec_simplify = str_split_fixed(species_sum2$species, " ", 2)
+species_sum2$species = paste0(substr(spec_simplify[,1], 1, 1),". ", spec_simplify[,2])
+species_sum2 = data.frame(species_sum2)
+rownames(species_sum2) = species_sum2$species
+species_sum2$species = NULL
+
+
+tr = tr_save
+tr_trim = keep.tip(tr, unique(df$species))
+plot(tr_trim)
+tr_trim$edge.length = log(tr_trim$edge.length) + abs(min(log(tr_trim$edge.length))) + 0.01
+spec_simplify = str_split_fixed(tr_trim$tip.label, "_", 2)
+tr_trim$tip.label = paste0(substr(spec_simplify[,1], 1, 1),". ", spec_simplify[,2])
+p = ggtree(tr_trim, layout = "circular")  +
+  geom_tiplab(align = T, size = 2)
+p = gheatmap(p, species_sum2, offset = 50, width = 0.3, colnames = F)  +
+  scale_fill_manual(values = palette_bi, name = "") +
+  theme(legend.position = "none")
+fig3b = open_tree(p,angle = 20)
+
+fig3 = ggarrange(fig3a, fig3b, heights = c(0.6, 1), ncol = 1)
+fig3
+
+```
+
+**Figure 3. Distribution of resistance over space and the tree of life.** A) Bi-scale map of resistance, describing the current frequency of resistance (in 2023; red) and change in resistance (between 1970 and 2023; blue). Frequency and change in resistance calculated as the cumulative probability of resistance across the 13 anti-microbials; B) Cumulative probability of resistance for each species across six decades: 1970, 1980, 1990, 2000, 2010, and 2020. To improve visulation, phylogentic branch lengths are presented on the log-scale.
+
+
+### Load datasets
+
+'data_gdp_wb.csv'. Metadata:
+iso3 = ISO-3 country code
+year = year of estimate
+gdp = gdp per capita at a 2015 constant
+
+'data_population_un.csv'. Metadata:
+iso3 = ISO-3 country code
+year = year of estimate
+pop = total population size as of January 1st in each year
+density = population density per km as July 1st in each year
+pop_rate = population growth rate per year, given as a percentage
+life_expectancy = life expectancy at birth (combined sexes)
+birth_mortality = mortality rate (per 1000) for children under 5
+migration rate = net migration per 1000 people
+
+
+data_health.... Metadata:
+iso3 = ISO-3 country code
+year = year of estimate
+health_gdp = health expenditure as a proportion of gdp
+beds = hospital beds per 1,000 people
+physicians = physicians per 1,000 people
+undernourishment = percentage of population experiencing undernourishment
+hiv = incidence of HIV per 1,000 people
+malaria = incidence of malaria per 1,000 people
+tuberculosis = incidence of tuberculosis per 1,000 people
+antiretroviral = percetnage of people infected with HIV recieving treatment
+
+
+data_environment... Metadata:
+iso3 = ISO-3 country code
+year = year of estimate
+rural = percentage of population in rural communities
+rural_growth = percentage growth in rural population
+urban = percentage of population in urban communities
+urban_growth = percentage growth in urban populations
+air_population = PM2.5 air pollution, mean annual exposure (micrograms per cubic meter)
+ag_land = Percentage of land occupied by agriculture
+
+
+data_governance... Metadata:
+iso3 = ISO-3 country code
+year = year of estimate
+gini = gini coefficient of inequality
+corruption = control of corruption
+gov = government effectiveness
+reg = regulatory quality
+acc = voice and accountability
+
+
+data_anti... Metadata:
+country = country name
+year = year of estimate
+anti = Antibiotic consumption (DDD/1,000/day)
+low = lower uncertainty estimate
+up = upper uncertainty estimate
+
+
+
+
+
+```{r res_drivers, fig.height=9, fig.width =9, warning=F, message = F}
+#Country level MDR now and change
+base = expand.grid(year = c(1990: 2023), iso3 = unique(subsampledf$ISO.3))
+
+coords = unique(df_save[,c("ISO.3", "centroid_lat", "centroid_lon")])
+coords = coords[complete.cases(coords),]
+r = getData("worldclim",var="bio",res=10)[[c(1)]]
+points = SpatialPoints(data.frame(x=coords$centroid_lon,y=coords$centroid_lat), proj4string = r@crs)
+coords$tavg = extract(r,points)/10
+
+
+population = read.csv("data_population_un.csv")
+population[population == "..."] = NA
+
+health = read.csv("data_health_wb.csv")
+health[health == ".."] = NA
+
+enviro = read.csv("data_enviro_wb.csv")
+enviro[enviro == ".."] = NA
+
+gov = read.csv("data_governance_wb.csv")
+gov[gov == ".."] = NA
+
+gdp = read.csv("data_gdp_wb.csv")
+gdp[gdp == ".."] = NA
+
+anti = read.csv("data_anti.csv")
+anti$iso3 = countrycode(anti$country, "country.name", "iso3c")
+anti$country = NULL
+
+anti2 = read.csv("data_anti2.csv")[,c(1,2,5,25)]
+
+base = left_join(base, coords, by = c("iso3" = "ISO.3"))
+base = left_join(base, population)
+base = left_join(base, health)
+base = left_join(base, enviro)
+base = left_join(base, gov)
+base = left_join(base, gdp)
+base = left_join(base, anti)
+base = left_join(base, anti2)
+
+
+miss_row = data.frame(year = base$year, iso3 = base$iso3, na = rowSums(is.na(base)))
+miss_row = miss_row %>%
+  group_by(year) %>%
+  summarise(na = mean(na))
+
+figs2 = ggplot(data = miss_row) +
+  geom_line(aes(x = year, y = na)) +
+  labs(x = "Year", y = "Mean number of missing values") +
+  theme_classic() #Majority of countires posses data in the studied timeframe
+
+
+base = base %>%
+  group_by(iso3) %>%
+  summarise(
+    lat = mean(as.numeric(centroid_lat), na.rm = T),
+    lon = mean(as.numeric(centroid_lon), na.rm = T),
+    density = mean(as.numeric(density), na.rm = T),
+    pop_rate = mean(as.numeric(pop_rate), na.rm = T),
+    life_expectancy = mean(as.numeric(life_expectancy), na.rm = T),
+    migration_rate = mean(as.numeric(migration_rate), na.rm = T),
+    health_gdp = mean(as.numeric(health_gdp), na.rm = T),
+    beds = mean(as.numeric(beds), na.rm = T),
+    physicians = mean(as.numeric(physicians), na.rm = T),
+    undernourishment = mean(as.numeric(undernourishment), na.rm = T),
+    antiretroviral = mean(as.numeric(antiretroviral), na.rm = T),
+    hiv = mean(as.numeric(hiv), na.rm = T),
+    air_pollution = mean(as.numeric(air_pollution), na.rm = T),
+    ag_land = mean(as.numeric(ag_land), na.rm = T),
+    gini = mean(as.numeric(gini), na.rm = T),
+    corruption = mean(as.numeric(corruption), na.rm = T),
+    gov = mean(as.numeric(gov), na.rm = T),
+    reg = mean(as.numeric(reg), na.rm = T),
+    acc = mean(as.numeric(acc), na.rm = T),
+    gdp = mean(as.numeric(gdp), na.rm = T),
+    anti = mean(as.numeric(anti), na.rm = T),
+    tavg = mean(as.numeric(tavg), na.rm = T)
+)
+base = base %>% mutate_all(~ifelse(is.nan(.), NA, .))
+base$gdp = log(base$gdp)
+base$undernourishment = log(base$undernourishment)
+base$hiv = log(base$hiv)
+base$density = log(base$density)
+cormat = round(cor(base[,c(4:23)], use="complete.obs"),1)
+cormat = reshape2::melt(cormat)
+
+figs3 = ggplot() + 
+  geom_tile(data = cormat, aes(x=Var1, y=Var2, fill=value)) +
+  scale_fill_gradient2(low = scales::muted("darkblue"), high = scales::muted("darkred"), na.value = "grey20", mid = "white", midpoint = 0, breaks = c(-1,-0.5,0,0.5,1), limits = c(-1,1), name = "Correlation\n") +
+  scale_x_discrete(expand = c(0,0)) +
+  scale_y_discrete(expand = c(0,0)) +
+  labs(x = "", y = "") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90),
+        legend.position = "bottom")
+
+```
+
+Using the posterior predictions of cumulative resistance for each country in the year 2023, we conducted a comparative analyses to explore assocations between resitance and a series of predictors. These predictors covered everything from antibiotic use to governance, temperature, and quality of health care. Combined, representing 23 variables. Many of these variables are highly correlated with one another which makes inference challenging. With this in mind, we explored the link between these predictors and the response variable in a simplifed linear model focussed solely on the predictors with the greatest mechansitic support: human density, propotion of GDP spent on health expeniture, governance effectiveness, antibiotic use, and the countries average temperature. We also added the following predictor interactions: health expenditure and antibiotic use, and governance effectiveness and anitbiotic use. We included these in a linear model with resistance as the response variable. We included a spatial covariance term to account for covariation in neighnouring countries.
+
+```{r figure4, fig.height=4, fig.width =8, warning=F, message = F}
+
+country_sum2 = left_join(country_sum2, base, by = c("ISO.3" = "iso3"))
+country_sum2_t = gather(country_sum2, predictor, value, density:tavg)
+
+figs4 = ggplot(country_sum2_t) +
+  geom_point(aes(x = value, y = mn_2023)) +
+  geom_smooth(aes(x = value, y = mn_2023), method = "lm") +
+  labs(x = "Value", y = "Resistance frequency in 2023") +
+  facet_wrap(predictor~., scales = "free") +
+  theme_classic()
+
+
+country_sum2 = country_sum2[complete.cases(country_sum2[,c(
+  "density",
+  "health_gdp",
+  "gov",
+  "gdp",
+  "gini",
+  "anti",
+  "tavg")]),]
+
+#Produce a spatial covariance matrix
+spa_df = unique(country_sum2[,c("ISO.3", "lat", "lon")])
+spa_mat_trim = as.matrix(distm(spa_df[,c(3,2)], fun = distHaversine))/1000000
+spa_mat_trim = norm_range(spa_mat_trim)
+spa_mat_trim = abs(spa_mat_trim - 1) 
+spa_id = spa_df$ISO.3
+colnames(spa_mat_trim) = spa_id
+rownames(spa_mat_trim) = spa_id
+country_sum2$space_id = country_sum2$ISO.3
+
+plot(country_sum2$mn_2023, country_sum2$mn_diff) #Highly correlated, just use absolute mdr i.e mn_2023
+
+form_inf = bf(mn_2023~
+                scale(density) +
+                scale(health_gdp) +
+                scale(gov) +
+                scale(anti) +
+                scale(tavg) +
+                scale(anti)*scale(health_gdp) +
+                scale(anti)*scale(gov) +
+                (1|gr(space_id, cov = space)))
+
+m_inf = brm(
+  formula = form_inf,
+  data = country_sum2,
+  data2 = list(space = spa_mat_trim), 
+  family = gaussian,
+  chains = 4, cores = 4, iter = 2000, warmup = 1000)
+
+figs5 = pp_check(m_inf) + 
+  theme_classic()
+model_check = DHARMa::createDHARMa(
+  simulatedResponse = (t(posterior_predict(m_inf))),
+  observedResponse = country_sum2$mn_2023,
+  fittedPredictedResponse = (apply(t(posterior_epred(m_inf)), 1, mean)),
+  integerResponse = FALSE)
+figs6 = plot(model_check)
+
+summary(m_inf)
+
+post_sum = as.data.frame(posterior_summary(m_inf, probs = c(0.025, 0.1, 0.25, 0.75, 0.9, 0.975))[c(2:8),])
+post_sum$var = c(
+  "Population density",
+  "Health expenditure",
+  "Governance",
+  "Antibiotic-use",
+  "Average temperature",
+  "Health expenditure:\nAntibiotic-use",
+  "Governance:\nAntibiotic-use"
+)
+post_sum$col = c(
+  "A",
+  "A",
+  "B",
+  "A",
+  "B",
+  "A",
+  "A"
+)
+
+fig4a = ggplot(post_sum) +
+  geom_linerange(aes(y = reorder(var, -Q2.5), xmin = Q2.5, xmax = Q97.5, colour = col), linewidth = 5, alpha = 0.4) +
+  geom_linerange(aes(y = reorder(var, -Q2.5), xmin = Q10, xmax = Q90, colour = col), linewidth = 5, alpha = 0.6) +
+  geom_linerange(aes(y = reorder(var, -Q2.5), xmin = Q25, xmax = Q75, colour = col), linewidth = 5, alpha = 0.8) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") + 
+  scale_colour_manual(guide = "none", values = c("grey30", scales::muted("#9e1919"))) +
+  labs(x = expression(beta), y= "") +
+  theme_classic()
+
+
+pred <- predictions(m_inf,
+                    newdata = datagrid(gov = seq(-2.5, 2.5, by = 0.05))) |>
+  posterior_draws()
+
+fig4b = ggplot(pred, aes(x = gov, y = exp(draw))) +
+  stat_lineribbon() +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_fill_manual(guide = "none",values = c(fill_alpha("#9e1919", 0.4), fill_alpha("#9e1919", 0.6), fill_alpha("#9e1919", 0.8))) +
+  labs(x = "Government effectivness",
+       y = expression("Resistance (N)")) +
+  theme_classic()
+
+pred <- predictions(m_inf,
+                    newdata = datagrid(tavg = seq(0, 30, by = 0.1))) |>
+  posterior_draws()
+
+fig4c = ggplot(pred, aes(x = tavg, y = exp(draw))) +
+  stat_lineribbon() +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_fill_manual(guide = "none",values = c(fill_alpha("#9e1919", 0.4), fill_alpha("#9e1919", 0.6), fill_alpha("#9e1919", 0.8))) +
+  labs(x = "Average temperature",
+       y = expression("Resistance (N)")) +
+  theme_classic()
+
+
+ggarrange(fig4a, fig4b, fig4c, ncol = 3, widths = c(1,0.7,0.7))
+
+
+
+```
+
+**Figure 4. Human density, health expenditure, and financial inequality are linked to resistance ** Marginal effect posterior predictions of the association between resistance and the following predictors: human density, health expenditure, and financial inequality. Error bars describe 95% credible intervals.
+
+
+
+
+
+### Supplementary material
+
+
+```{r figure_s1, fig.height=14, fig.width =11, warning=F, message = F, echo = F}
+ggarrange(plotlist = pp_list, ncol = 2, nrow = 7)
+```
+
+**Figure S1. Posterior predictive checks of temporal trend model ** 
+
+
+```{r figure_s2, fig.height=4, fig.width =8, warning=F, message = F, echo = F}
+figs2
+```
+
+**Figure S2. Percentage of predictors missing values predictors over time ** 
+
+
+```{r figure_s3, fig.height=9, fig.width =9, warning=F, message = F, echo = F}
+figs3
+```
+
+**Figure S3. Pairwise correlation in predictors ** 
+
+
+```{r figure_s4, fig.height=11, fig.width =8, warning=F, message = F, echo = F}
+figs4
+```
+
+**Figure S4. Univriate association between resistance and each predictor ** 
+
+
+```{r figure_s5, fig.height=4, fig.width =8, warning=F, message = F, echo = F}
+figs5
+```
+
+**Figure S5. Posterior predictive check ** 
+
+
+```{r figure_s6, fig.height=5, fig.width =8, warning=F, message = F, echo = F}
+figs6
+```
+
+**Figure S6. Assumption checking ** 
+
+```{r robitt_compare_systematic, fig.height=5, fig.width =8, warning=F, message = F}
+library(arrow)
+library(brms)
+library(dplyr)
+library(ggrepel)
+
+df = df_save
+colnames(df)[10] = "Betalactams"
+
+struc = read.csv("struc.csv")
+struc$ind = 1
+struc$id = as.character(struc$id)
+#Test 1 - C. jejuni
+tmp = subset(df, species == "Campylobacter jejuni")
+tmp = left_join(tmp, struc)
+
+struc_tmp = subset(tmp, ind == 1)
+struc_tmp$year = struc_tmp$year - 2023 #2023 - 20 etc
+range(struc_tmp$year) #2023 - 20 etc
+unique(struc_tmp$ISO.3) #GBR
+tmp = subset(tmp, !is.na(year))
+tmp$year = tmp$year - 2023
+tmp = subset(tmp, ISO.3 == "GBR")
+tmp = subset(tmp, year >= -20)
+tmp = subset(tmp, year <= -6)
+
+
+struc_isolate = subset(tmp, ind == 1)
+struc_isolate$uni_id = 1:nrow(struc_isolate)
+nstruc_isolate = subset(tmp, is.na(ind))
+nstruc_isolate$uni_id = 1:nrow(nstruc_isolate)
+
+form =
+  bf(mvbind(
+    Aminoglycosides, 
+    Betalactams, 
+    Polymyxins, 
+    Fosfomycin, 
+    Glycopeptides, 
+    Macrolides, 
+    Oxazolidinones, 
+    Phenicols, 
+    Quinolones, 
+    Rifampicin, 
+    Sulphonamides,
+    Tetracyclines,
+    Trimethoprim) ~ 
+      year 
+  )  + set_rescor(FALSE)
+
+
+#fit_struc = brm(form, 
+#           data = struc_isolate, 
+#           chains = 4, cores = 4, iter = 1000, warmup = 500, thin = 1, refresh = 10,
+#           family = bernoulli)
+#saveRDS(fit_struc, "fit_struc1.rds")
+fit_struc = readRDS("fit_struc1.rds")
+
+#fit_nstruc = brm(form, 
+#          data = nstruc_isolate, 
+#          chains = 4, cores = 4, iter = 1000, warmup = 500, thin = 1, refresh = 10,
+#          family = bernoulli)
+#saveRDS(fit_nstruc, "fit_nstruc1.rds")
+fit_nstruc = readRDS("fit_nstruc1.rds")
+
+
+
+nd = tmp[c(1:15),c(10:24)]
+nd$year = c(-20:-6)
+nd[,c(2:14)] = NA
+
+pred1 = posterior_linpred(fit_struc, newdata = nd, transform = T, re.form = NA)
+pred2 = posterior_linpred(fit_nstruc, newdata = nd, transform = T, re.form = NA)
+
+nam = c("Aminoglycosides", "Betalactams", "Polymyxins", "Fosfomycin", "Glycopeptides", "Macrolides", "Oxazolidinones", "Phenicols", "Quinolones", "Rifampicin", "Sulphonamides","Tetracyclines","Trimethoprim")
+
+pred_cmb = NULL
+pred_cmb2 = NULL
+for(a in c(1:13)){
+  pred1_tmp = pred1[,,a]
+  pred2_tmp = pred2[,,a]
+  sum_dat = data.frame(
+    cat = nam[a],
+    x =  c(2003:2017),
+    med1 = apply(pred1_tmp, 2, quantile, probs = 0.5),
+    high1 = apply(pred1_tmp, 2, quantile, probs = 0.75),
+    low1 = apply(pred1_tmp, 2, quantile, probs = 0.25),
+    med2 = apply(pred2_tmp, 2, quantile, probs = 0.5),
+    high2 = apply(pred2_tmp, 2, quantile, probs = 0.75),
+    low2 = apply(pred2_tmp, 2, quantile, probs = 0.25))
+  pred_cmb = rbind(pred_cmb, sum_dat)
+  
+}
+
+
+ggplot(pred_cmb) +
+  geom_line(aes(x = x, y = med1), alpha = 0.3) +
+  geom_line(aes(x = x, y = med2), colour = "darkred", alpha = 0.3) +
+  geom_ribbon(aes(x = x, ymin = low1, ymax = high1), alpha = 0.3) +
+  geom_ribbon(aes(x = x, ymin = low2, ymax = high2), fill = "darkred", alpha = 0.3) +
+  labs(x = "Year", y = "Probability of resistance") +
+  theme_classic() +
+  facet_wrap(cat~., scales = "free")
+
+slp_df = data.frame(
+  fix1 = summary(fit_struc)$fixed[c(14:26),1],
+  fix2 = summary(fit_nstruc)$fixed[c(14:26),1],
+  names = nam)
+
+ggplot(data = slp_df, aes(x = fix1, y = fix2)) +
+  geom_point() +
+  geom_abline(aes(intercept = 0, slope = 1), linetype = "dashed") +
+  labs(x = "Structured Beta", y = "Unstructured Beta") +
+  theme_classic()
+
+
+
+#Test 2 - S. pneumoniae
+tmp = subset(df, species == "Streptococcus pneumoniae")
+tmp = left_join(tmp, struc)
+tmp$ISO.3 = ifelse(tmp$country == "Morocco", "MAR", tmp$ISO.3)#Morocco country codes are incorrect and represent month of year.
+
+struc_tmp = subset(tmp, ind == 1)
+struc_tmp$year = struc_tmp$year - 2023
+range(struc_tmp$year, na.rm = T) 
+unique(struc_tmp$ISO.3) 
+tmp = subset(tmp, !is.na(year))
+tmp = tmp[which(tmp$ISO.3 %in% unique(struc_tmp$ISO.3)),]
+tmp$year = tmp$year - 2023 #2023 - 20 etc
+tmp = subset(tmp, year >= -39)
+tmp = subset(tmp, year <= -6)
+
+
+struc_isolate = subset(tmp, ind == 1)
+struc_isolate$uni_id = 1:nrow(struc_isolate)
+
+#Produce a spatial covariance matrix
+spa_df = unique(struc_isolate[,c("ISO.3", "centroid_lat", "centroid_lon")])
+spa_df = subset(spa_df, !is.na(spa_df$centroid_lat))
+spa_mat_trim = as.matrix(distm(spa_df[,c(3,2)], fun = distHaversine))/1000000
+spa_mat_trim = norm_range(spa_mat_trim)
+spa_mat_trim = abs(spa_mat_trim - 1) 
+spa_id = spa_df$ISO.3
+colnames(spa_mat_trim) = spa_id
+rownames(spa_mat_trim) = spa_id
+
+struc_isolate$space_id = struc_isolate$ISO.3
+
+
+
+form =
+  bf(mvbind(
+    Aminoglycosides, 
+    Betalactams, 
+    Polymyxins, 
+    Fosfomycin, 
+    Glycopeptides, 
+    Macrolides, 
+    Oxazolidinones, 
+    Phenicols, 
+    Quinolones, 
+    Rifampicin, 
+    Sulphonamides,
+    Tetracyclines,
+    Trimethoprim) ~ 
+      year + 
+      (1 + year|ISO.3) +
+      (1|gr(space_id, cov = space)) 
+  )  + set_rescor(FALSE)
+
+#fit_struc = brm(form, 
+#                data = struc_isolate, 
+#                data2 = list(space = spa_mat_trim), 
+#                chains = 4, cores = 4, iter = 1000, warmup = 500, thin = 1, refresh = 10,
+#                family = bernoulli)
+#saveRDS(fit_struc, "fit_struc2.rds")
+fit_struc = readRDS("fit_struc2.rds")
+
+nstruc_isolate = subset(tmp, is.na(ind))
+nstruc_isolate$uni_id = 1:nrow(nstruc_isolate)
+
+#Produce a spatial covariance matrix
+nstruc_isolate = subset(nstruc_isolate, nstruc_isolate$ISO.3 != "MAR")
+spa_df = unique(nstruc_isolate[,c("ISO.3", "centroid_lat", "centroid_lon")])
+spa_df = subset(spa_df, !is.na(spa_df$centroid_lat))
+spa_mat_trim = as.matrix(distm(spa_df[,c(3,2)], fun = distHaversine))/1000000
+spa_mat_trim = norm_range(spa_mat_trim)
+spa_mat_trim = abs(spa_mat_trim - 1) 
+spa_id = spa_df$ISO.3
+colnames(spa_mat_trim) = spa_id
+rownames(spa_mat_trim) = spa_id
+
+nstruc_isolate$space_id = nstruc_isolate$ISO.3
+
+#fit_nstruc = brm(form, 
+#                 data = nstruc_isolate, 
+#                 data2 = list(space = spa_mat_trim), 
+#                 chains = 4, cores = 4, iter = 1000, warmup = 500, thin = 1, refresh = 10,
+#                 family = bernoulli)
+#saveRDS(fit_nstruc, "fit_nstruc2.rds")
+fit_nstruc = readRDS("fit_nstruc2.rds")
+
+
+nd = tmp[c(1:23),c(10:24)]
+nd$year = c(-28:-6)
+nd[,c(2:14)] = NA
+
+pred1 = posterior_linpred(fit_struc, newdata = nd, transform = T, re.form = NA)
+pred2 = posterior_linpred(fit_nstruc, newdata = nd, transform = T, re.form = NA)
+
+nam = c("Aminoglycosides", "Betalactams", "Polymyxins", "Fosfomycin", "Glycopeptides", "Macrolides", "Oxazolidinones", "Phenicols", "Quinolones", "Rifampicin", "Sulphonamides","Tetracyclines","Trimethoprim")
+
+pred_cmb = NULL
+pred_cmb2 = NULL
+for(a in c(1:13)){
+  pred1_tmp = pred1[,,a]
+  pred2_tmp = pred2[,,a]
+  sum_dat = data.frame(
+    cat = nam[a],
+    x =  c(1995:2017),
+    med1 = apply(pred1_tmp, 2, quantile, probs = 0.5),
+    high1 = apply(pred1_tmp, 2, quantile, probs = 0.75),
+    low1 = apply(pred1_tmp, 2, quantile, probs = 0.25),
+    med2 = apply(pred2_tmp, 2, quantile, probs = 0.5),
+    high2 = apply(pred2_tmp, 2, quantile, probs = 0.75),
+    low2 = apply(pred2_tmp, 2, quantile, probs = 0.25))
+  pred_cmb = rbind(pred_cmb, sum_dat)
+
+}
+
+ggplot(pred_cmb) +
+  geom_line(aes(x = x, y = med1), alpha = 0.3) +
+  geom_line(aes(x = x, y = med2), colour = "darkred", alpha = 0.3) +
+  geom_ribbon(aes(x = x, ymin = low1, ymax = high1), alpha = 0.3) +
+  geom_ribbon(aes(x = x, ymin = low2, ymax = high2), fill = "darkred", alpha = 0.3) +
+  labs(x = "Year", y = "Probability of resistance") +
+  theme_classic() +
+  facet_wrap(cat~., scales = "free")
+
+slp_df = data.frame(
+  fix1 = summary(fit_struc)$fixed[c(14:26),1],
+  fix2 = summary(fit_nstruc)$fixed[c(14:26),1],
+  names = nam)
+
+ggplot(data = slp_df, aes(x = fix1, y = fix2)) +
+  geom_point() +
+  geom_abline(aes(intercept = 0, slope = 1), linetype = "dashed") +
+  labs(x = "Structured Beta", y = "Unstructured Beta") +
+  theme_classic()
+
+
+
+
+#Test 3 - Neisseria gonorrhoeae
+tmp = subset(df, species == "Neisseria gonorrhoeae")
+tmp = left_join(tmp, struc)
+tmp$year = tmp$year - 2023
+
+struc_tmp = subset(tmp, ind == 1)
+range(struc_tmp$year, na.rm = T) #2023 - 20 etc
+tmp = subset(tmp, !is.na(year))
+unique(struc_tmp$ISO.3) 
+struc_tmp = subset(struc_tmp, struc_tmp$ISO.3 != "UGANDA")
+struc_tmp = subset(struc_tmp, struc_tmp$ISO.3 != "")
+struc_tmp = subset(struc_tmp, struc_tmp$ISO.3 != "JUL")
+struc_tmp = subset(struc_tmp, struc_tmp$ISO.3 != "SEP")
+tmp = tmp[which(tmp$ISO.3 %in% unique(struc_tmp$ISO.3)),]
+tmp = subset(tmp, year >= -33) #min 1990
+tmp = subset(tmp, year <= -5)
+
+
+struc_isolate = subset(tmp, ind == 1)
+struc_isolate$uni_id = 1:nrow(struc_isolate)
+
+#Produce a spatial covariance matrix
+spa_df = unique(struc_isolate[,c("ISO.3", "centroid_lat", "centroid_lon")])
+spa_mat_trim = as.matrix(distm(spa_df[,c(3,2)], fun = distHaversine))/1000000
+spa_mat_trim = norm_range(spa_mat_trim)
+spa_mat_trim = abs(spa_mat_trim - 1) 
+spa_id = spa_df$ISO.3
+colnames(spa_mat_trim) = spa_id
+rownames(spa_mat_trim) = spa_id
+
+struc_isolate$space_id = struc_isolate$ISO.3
+
+
+
+form =
+  bf(mvbind(
+    Aminoglycosides, 
+    Betalactams, 
+    Polymyxins, 
+    Fosfomycin, 
+    Glycopeptides, 
+    Macrolides, 
+    Oxazolidinones, 
+    Phenicols, 
+    Quinolones, 
+    Rifampicin, 
+    Sulphonamides,
+    Tetracyclines,
+    Trimethoprim) ~ 
+      year + 
+      (1 + year|ISO.3) +
+      (1|gr(space_id, cov = space)) 
+  )  + set_rescor(FALSE)
+
+#fit_struc = brm(form, 
+#                data = struc_isolate, 
+#                data2 = list(space = spa_mat_trim), 
+#                chains = 4, cores = 4, iter = 1000, warmup = 500, thin = 1, refresh = 10,
+#                family = bernoulli)
+#saveRDS(fit_struc, "fit_struc3.rds")
+fit_struc = readRDS("fit_struc3.rds")
+
+nstruc_isolate = subset(tmp, is.na(ind))
+nstruc_isolate$uni_id = 1:nrow(nstruc_isolate)
+
+#Produce a spatial covariance matrix
+spa_df = unique(nstruc_isolate[,c("ISO.3", "centroid_lat", "centroid_lon")])
+spa_mat_trim = as.matrix(distm(spa_df[,c(3,2)], fun = distHaversine))/1000000
+spa_mat_trim = norm_range(spa_mat_trim)
+spa_mat_trim = abs(spa_mat_trim - 1) 
+spa_id = spa_df$ISO.3
+colnames(spa_mat_trim) = spa_id
+rownames(spa_mat_trim) = spa_id
+
+nstruc_isolate$space_id = nstruc_isolate$ISO.3
+
+#fit_nstruc = brm(form, 
+#                 data = nstruc_isolate, 
+#                 data2 = list(space = spa_mat_trim), 
+#                 chains = 4, cores = 4, iter = 1000, warmup = 500, thin = 1, refresh = 10,
+#                 family = bernoulli)
+#saveRDS(fit_nstruc, "fit_nstruc3.rds")
+fit_nstruc = readRDS("fit_nstruc3.rds")
+
+nd = tmp[c(1:23),c(10:24)]
+nd$year = c(-28:-6)
+nd[,c(2:14)] = NA
+
+pred1 = posterior_linpred(fit_struc, newdata = nd, transform = T, re.form = NA)
+pred2 = posterior_linpred(fit_nstruc, newdata = nd, transform = T, re.form = NA)
+
+nam = c("Aminoglycosides", "Betalactams", "Polymyxins", "Fosfomycin", "Glycopeptides", "Macrolides", "Oxazolidinones", "Phenicols", "Quinolones", "Rifampicin", "Sulphonamides","Tetracyclines","Trimethoprim")
+
+pred_cmb = NULL
+pred_cmb2 = NULL
+for(a in c(1:13)){
+  pred1_tmp = pred1[,,a]
+  pred2_tmp = pred2[,,a]
+  sum_dat = data.frame(
+    cat = nam[a],
+    x =  c(1995:2017),
+    med1 = apply(pred1_tmp, 2, quantile, probs = 0.5),
+    high1 = apply(pred1_tmp, 2, quantile, probs = 0.75),
+    low1 = apply(pred1_tmp, 2, quantile, probs = 0.25),
+    med2 = apply(pred2_tmp, 2, quantile, probs = 0.5),
+    high2 = apply(pred2_tmp, 2, quantile, probs = 0.75),
+    low2 = apply(pred2_tmp, 2, quantile, probs = 0.25))
+  pred_cmb = rbind(pred_cmb, sum_dat)
+
+}
+
+ggplot(pred_cmb) +
+  geom_line(aes(x = x, y = med1), alpha = 0.3) +
+  geom_line(aes(x = x, y = med2), colour = "darkred", alpha = 0.3) +
+  geom_ribbon(aes(x = x, ymin = low1, ymax = high1), alpha = 0.3) +
+  geom_ribbon(aes(x = x, ymin = low2, ymax = high2), fill = "darkred", alpha = 0.3) +
+    labs(x = "Year", y = "Probability of resistance") +
+  theme_classic() +
+  facet_wrap(cat~., scales = "free")
+
+slp_df = data.frame(
+  fix1 = summary(fit_struc)$fixed[c(14:26),1],
+  fix2 = summary(fit_nstruc)$fixed[c(14:26),1],
+  names = nam)
+
+ggplot(data = slp_df, aes(x = fix1, y = fix2)) +
+  geom_point() +
+  geom_abline(aes(intercept = 0, slope = 1), linetype = "dashed") +
+  labs(x = "Structured Beta", y = "Unstructured Beta") +
+  theme_classic()
+
+```
