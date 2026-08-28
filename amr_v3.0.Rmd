@@ -1,0 +1,4618 @@
+---
+title: "Code for: Global genomic surveillance of antimicrobial resistance"
+author: "Johnson T.F. Reviewed by Evans L.C."
+date: "2026-08-21"
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+  pdf_document: default
+geometry: left=1cm,right=1cm,top=2cm,bottom=2cm
+classoption: portrait
+---
+
+# 1 Setup
+
+## 1.1 Render
+
+knitr defaults for the report, hiding raw output and standardising plot appearance and line wrapping.
+
+```{r 1_1_render, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  error = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  dpi = 500,
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 60)
+)
+
+
+```
+
+## 1.2 Packages
+
+Loads packages used for data cleaning, modelling, phylogenetic work, plotting, and file handling.
+
+```{r 1_2_packages}
+library(tidyverse)
+library(dagitty)
+library(ggdag)
+library(readxl)
+library(rnaturalearth)
+library(sf)
+library(cmdstanr)
+library(posterior)
+library(brms)
+library(mgcv)
+library(Matrix)
+library(ape)
+library(phangorn)
+library(countrycode)
+library(ggdist)
+library(patchwork)
+library(cowplot)
+library(purrr)
+library(ggtree)
+library(tibble)
+library(ggplotify)
+library(ggnewscale)
+library(mvtnorm)
+```
+
+## 1.3 Functions
+
+hHelper functions used later for correlation regularisation, spatial and phylogenetic preparation, summary statistics, label formatting, and correlation-matrix construction.
+
+```{r 1_3_functions}
+#Regularise correlation matrix
+regularise_cor <- function(R, eps = 1e-6) {
+  R <- (R + t(R)) / 2
+  diag(R) <- diag(R) + eps
+  cov2cor(R)
+}
+
+#Prepare data for for Resistance trajectory model. Includes derivation of phylogentic and spatial covariance matrix
+prep_data <- function(dat, tree) {
+
+  spa_df <- dat %>%
+    group_by(ISO.3) %>%
+    summarise(
+      centroid_lat = mean(centroid_lat, na.rm = TRUE),
+      centroid_lon = mean(centroid_lon, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(
+      !is.na(ISO.3),
+      is.finite(centroid_lat),
+      is.finite(centroid_lon)
+    ) %>%
+    arrange(ISO.3)
+
+  coords <- sf::st_as_sf(
+    spa_df,
+    coords = c("centroid_lon", "centroid_lat"),
+    crs = 4326
+  )
+
+  spa_dist <- as.matrix(units::drop_units(sf::st_distance(coords))) / 1e6
+
+  spa_cor <- exp(
+    -spa_dist / median(spa_dist[spa_dist > 0], na.rm = TRUE)
+  )
+
+  rownames(spa_cor) <- colnames(spa_cor) <- spa_df$ISO.3
+  spa_cor <- regularise_cor(spa_cor)
+
+  species_keep <- intersect(unique(dat$species), tree$tip.label)
+  tree_trim <- ape::keep.tip(tree, species_keep)
+
+  tree_trim$edge.length[is.na(tree_trim$edge.length)] <- 0
+  tree_trim$edge.length <- tree_trim$edge.length + 0.001
+
+  phylo_cor <- ape::vcv.phylo(tree_trim, corr = TRUE)
+
+  phylo_cor <- regularise_cor(as.matrix(phylo_cor))
+
+  dat <- dat %>%
+    filter(
+      species %in% rownames(phylo_cor),
+      ISO.3 %in% rownames(spa_cor)
+    ) %>%
+    mutate(
+      species = factor(as.character(species), levels = rownames(phylo_cor)),
+      ISO.3 = factor(as.character(ISO.3), levels = rownames(spa_cor)),
+      species_id = as.integer(species),
+      country_id = as.integer(ISO.3),
+      n_antibiotics = length(ab_list),
+      year_z = as.numeric(scale(year))
+    )
+  
+
+  sc <- mgcv::smoothCon(
+    mgcv::s(year_z, k = 3, bs = "tp"),
+    data = as.data.frame(dat),
+    absorb.cons = TRUE
+  )[[1]]
+
+  B_year <- scale(sc$X)
+
+  list(
+    dat = dat,
+    phylo_cor = phylo_cor,
+    space_cor = spa_cor,
+    tree = tree_trim,
+    species_levels = rownames(phylo_cor),
+    country_levels = rownames(spa_cor),
+    sc = sc,
+    B_year = B_year,
+    year_center = mean(dat$year, na.rm = TRUE),
+    year_scale = sd(dat$year, na.rm = TRUE)
+  )
+}
+
+#Develops a bivariate colour palette for plotting resistance 1990 vs 2023
+bi_colour_continuous <- function(x, y, palette_bi) {
+  
+  x <- pmin(pmax(x, 0), 1)
+  y <- pmin(pmax(y, 0), 1)
+  
+  c00 <- grDevices::col2rgb(palette_bi$low_low)   / 255
+  c10 <- grDevices::col2rgb(palette_bi$high_low)  / 255
+  c01 <- grDevices::col2rgb(palette_bi$low_high)  / 255
+  c11 <- grDevices::col2rgb(palette_bi$high_high) / 255
+  
+  rgb_mat <-
+    c00 %*% t((1 - x) * (1 - y)) +
+    c10 %*% t(x * (1 - y)) +
+    c01 %*% t((1 - x) * y) +
+    c11 %*% t(x * y)
+  
+  grDevices::rgb(
+    red   = rgb_mat[1, ],
+    green = rgb_mat[2, ],
+    blue  = rgb_mat[3, ]
+  )
+}
+
+#Derive credible intervals over vector
+summ_prob <- function(x) {
+  tibble::tibble(
+    q025 = stats::quantile(x, .025, na.rm = TRUE),
+    q10  = stats::quantile(x, .10,  na.rm = TRUE),
+    q25  = stats::quantile(x, .25,  na.rm = TRUE),
+    q50  = stats::quantile(x, .50,  na.rm = TRUE),
+    q75  = stats::quantile(x, .75,  na.rm = TRUE),
+    q90  = stats::quantile(x, .90,  na.rm = TRUE),
+    q975 = stats::quantile(x, .975, na.rm = TRUE)
+  )
+}
+
+#If polymyxins or oxazolidinoones, specify intrinsic resistance to gram +/-
+make_intrinsic_smooth_rows <- function(ab, gram_to_hardcode) {
+  all_species_gram %>%
+    dplyr::filter(gram == gram_to_hardcode) %>%
+    tidyr::crossing(year = analysis_years) %>%
+    dplyr::transmute(
+      antibiotic = ab,
+      species,
+      gram,
+      year,
+      q025 = 1,
+      q10  = 1,
+      q25 = 1,
+      q50 = 1,
+      q75  = 1,
+      q90 = 1,
+      q975 = 1,
+      source = "intrinsic"
+    )
+}
+
+#Shorten species names for plotting
+short_species_label <- function(x) {
+  x <- ifelse(
+  x == "Listeria_fleischmannii_coloradonensis",
+  "Listeria_fleischmannii", as.character(x))
+  x <- gsub("_", " ", x)
+  parts <- strsplit(x, " ")
+  vapply(parts, function(z) {
+    if (length(z) < 2) return(z[1])
+    paste0(substr(z[1], 1, 1), ". ", paste(z[-1], collapse = " "))
+  }, character(1))
+}
+
+#Derive correlation matrix across antimicrobials
+make_R <- function(u, D = length(ab_list), labels = ab_list) {
+  r <- tanh(u)
+  L <- matrix(0, D, D)
+
+  L[1, 1] <- 1
+  pos <- 1
+
+  for (i in 2:D) {
+    prod_val <- 1
+
+    for (j in 1:(i - 1)) {
+      L[i, j] <- r[pos] * sqrt(prod_val)
+      prod_val <- prod_val * (1 - r[pos]^2)
+      pos <- pos + 1
+    }
+
+    L[i, i] <- sqrt(prod_val)
+  }
+
+  R <- L %*% t(L)
+  rownames(R) <- colnames(R) <- labels
+
+  R
+}
+
+#Take predicted probabilities and covariance across antimicrobials, and simulate resistance frequency
+simulate_counts_from_R <- function(P, R, scenario = NULL, n_sim = NULL, draw_id = NULL, eps = 1e-6) {
+  P <- pmin(pmax(P, eps), 1 - eps)
+
+  z_sim <- mvtnorm::rmvnorm(
+    n = nrow(P),
+    mean = rep(0, ncol(P)),
+    sigma = R
+)
+
+  z_sim <- z_sim + qnorm(P)
+
+  y_sim <- z_sim > 0
+
+  out <- tibble::tibble(
+    resistant_count = rowSums(y_sim)
+  )
+
+  if (!is.null(scenario)) {
+    out$scenario <- scenario
+  }
+
+  if (!is.null(draw_id)) {
+    if (length(draw_id) != nrow(P)) {
+      stop("`draw_id` must have the same length as `P` has rows.")
+    }
+    out$draw_id <- draw_id
+  }
+
+  dplyr::relocate(
+    out,
+    dplyr::any_of(c("scenario", "draw_id")),
+    resistant_count
+  )
+}
+```
+
+## 1.4 Parameters
+
+Parameters for analysis years, antibiotic groups, probability scale, and colour palette shared across the report.
+
+```{r 1_4_parameters}
+set.seed(1)
+
+analysis_years <- 1990:2023
+
+ab_list <- c(
+  "Aminoglycosides",
+  "Betalactams",
+  "Polymyxins",
+  "Fosfomycin",
+  "Glycopeptides",
+  "Macrolides",
+  "Oxazolidinones",
+  "Phenicols",
+  "Quinolones",
+  "Rifampicin",
+  "Sulphonamides",
+  "Tetracyclines",
+  "Trimethoprim"
+)
+
+p_min <- 1e-4
+log_breaks <- c(1e-4, 1e-3, 1e-2, 1e-1, 1)
+log_labels <- c("0.0001", "0.001", "0.01", "0.1", "1")
+
+palette_bi <- list(
+  low_low   = "white",  # low x, low y
+  high_low  = "grey10",   # high x, low y
+  low_high  = "#e02f2f",  # low x, high y
+  high_high = "#870101"   # high x, high y
+)
+
+# Build background directly on log10 probability scale
+bi_background_log_df <- tidyr::expand_grid(
+  x = seq(log10(p_min), 0, length.out = 300),
+  y = seq(log10(p_min), 0, length.out = 300)
+) %>%
+  dplyr::mutate(
+    x01 = scales::rescale(x, to = c(0, 1)),
+    y01 = scales::rescale(y, to = c(0, 1)),
+    fill = bi_colour_continuous(
+      x = x01,
+      y = y01,
+      palette_bi = palette_bi
+    )
+  )
+```
+
+# 2 Data
+
+The data are assembled from multiple public repositories and curated metadata fields, including species, country, year, and resistance phenotype. A structured sampling flag is used to distinguish surveillance-style records from opportunistic records where sequencing may have been influenced by clinical suspicion or prior resistance information.
+
+That distinction matters because the central bias in genomic AMR data is not only missingness, but selection into sequencing itself. The analysis therefore treats surveillance records as especially informative calibration data and opportunistic records as potentially enriched observations that require correction.
+
+## 2.1 Load
+
+This chunk reads the isolate table and supporting metadata, then harmonises identifiers and applies the initial cleaning filters.
+
+```{r 2_1_load}
+isolates <- read.csv("data/isolates.csv")
+structured_sampling <- read.csv("data/structured_sampling.csv") %>% mutate(id = as.character(id), is_surveillance = 1L)
+phylo <- ape::read.tree("data/species_level_tree.newick")
+gram_status <- read.csv("data/gram_status.csv")
+
+species_list_save = data.frame(
+  species = phylo$tip.label,
+  species_short = short_species_label(phylo$tip.label)
+)
+
+isolates_clean <- isolates %>%
+  left_join(structured_sampling, by = c("Database","id")) %>%
+  mutate(is_surveillance = replace_na(is_surveillance, 0L)) %>%
+  left_join(gram_status, by = "species") %>%
+#Interpolated score between 1990 and 2023 estimate
+    filter(
+      year %in% analysis_years,
+      !is.na(ISO.3),
+      !is.na(species),
+      !is.na(gram)
+  )
+```
+
+## 2.2 Summarise
+
+This chunk creates a simple coverage summary so the size and scope of the cleaned dataset are visible at a glance.
+
+```{r 2_2_summarise, results='asis'}
+coverage_summary <- tibble::tibble(
+  Metric = c(
+    "Isolates",
+    "Species",
+    "Countries",
+    "Years",
+    "Antibiotic classes",
+    "Structured surveillance records"
+  ),
+  Value = c(
+    scales::comma(nrow(isolates_clean)),
+    scales::comma(n_distinct(isolates_clean$species)),
+    scales::comma(n_distinct(isolates_clean$ISO.3)),
+    scales::comma(n_distinct(isolates_clean$year)),
+    scales::comma(length(ab_list)),
+    scales::comma(sum(isolates_clean$is_surveillance == 1L, na.rm = TRUE))
+  )
+)
+
+knitr::kable(
+  coverage_summary,
+  col.names = c("Metric", "Value"),
+  align = c("l", "r"),
+  caption = "Core coverage summary used in the bias assessment."
+)
+```
+
+## 2.3 Assess bias
+
+The objective of this risk of bias assessment (following aspects of ROBITT: 10.1111/2041-210X.13857), is to ascertain if any biases are likely to influence our ability to detect the target estimand - spatial, temporal and phylogentic variability in resistance probabilties and frequencies.
+
+### 2.3.1 Geographic domain
+
+The geographic domain is the clearest source of coverage bias. Public bacterial genome data are not evenly distributed across the world; they are concentrated in countries with stronger surveillance infrastructure, greater sequencing capacity, and a larger publication footprint. This means the raw data are unlikely to be representative of global geography. This chunk summarises geographic coverage and plots the country-level bias diagnostics used in the risk-of-bias assessment.
+
+```{r 2_3_1_geographic_domain, fig.width=7, fig.height=7}
+# Country-level and country-year coverage diagnostics.
+country_years <- isolates_clean %>%
+  distinct(ISO.3, year) %>%
+  count(ISO.3, name = "year_n")
+
+species_years <- isolates_clean %>%
+  distinct(species, year) %>%
+  count(species, name = "year_n")
+
+geog_df <- isolates_clean %>%
+  group_by(ISO.3) %>%
+  summarise(N = n(), .groups = "drop")
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+geog_df <- left_join(world, geog_df, by = c("iso_a3" = "ISO.3"))
+
+geo_count_plot <- ggplot(data = geog_df) +
+  geom_sf(aes(fill = N), colour = "grey70", linewidth = 0.1) +
+  scale_fill_viridis_c(
+    option = "magma",
+    trans = "log10",
+    breaks = c(1, 10, 100, 1000, 10000),
+    labels = scales::comma,
+    na.value = "grey90",
+    name = "Isolates"
+  ) +
+  labs(
+    title = "Geographic concentration of isolates",
+    subtitle = "Raw isolate counts by country",
+    x = NULL,
+    y = NULL
+  ) +
+  theme(panel.grid = element_blank())
+geo_count_plot
+
+geo_percap_plot <- ggplot(data = geog_df) +
+  geom_sf(aes(fill = N / (pop_est / 1000000)), colour = "grey70", linewidth = 0.1) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    trans = "log10",
+    breaks = c(0.1, 1, 10, 100, 1000),
+    labels = c("0.1", "1", "10", "100", "1000"),
+    na.value = "grey90",
+    name = "Isolates per million"
+  ) +
+  labs(
+    title = "Coverage adjusted for population size",
+    subtitle = "The same data emphasised on a per-capita basis",
+    x = NULL,
+    y = NULL
+  ) +
+  theme(panel.grid = element_blank())
+geo_percap_plot
+
+geog_time_df <- isolates_clean %>%
+  group_by(ISO.3, year) %>%
+  summarise(N = n(), .groups = "drop")
+```
+
+The geographic diagnostics should be read as evidence of selection, not of failure. The paper's aim is explicitly to correct for this unevenness, so the presence of geographic bias is expected. The relevant question is whether the model accounts for it transparently. Here, the answer is yes: spatial structure is modelled directly, and the raw counts are used to characterise imbalance rather than to support naive comparisons.
+
+### 2.3.2 Temporal domain
+
+The temporal domain is also biased because sequencing, and thus repository size, have increased substantially over the study's temporal extent. This means early resistance estimates can be imprecise because the data are sparse.
+
+```{r 2_3_1_geographic_domain2, fig.width=7, fig.height=7}
+time_df <- isolates_clean %>%
+  group_by(year) %>%
+  summarise(N = n(), .groups = "drop")
+
+temporal_country_plot <- ggplot(time_df) +
+  geom_col(aes(x = year, y = N), colour = "grey80", fill = "grey60", linewidth = 0.1) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Annual coverage across countries",
+    subtitle = "The number of country-year combinations is uneven, especially early in the time series.",
+    x = NULL,
+    y = "Country-year isolate count"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+temporal_country_plot
+
+bias_assessment <- read.csv("data/bias_assessment.csv")
+
+bias_year_summary <- data.frame(
+  year = c(1990, 2023),
+  mn = c(
+    mean(bias_assessment$bias_score_1990, na.rm = TRUE),
+    mean(bias_assessment$bias_score_2023, na.rm = TRUE)
+  ),
+  sd = c(
+    sd(bias_assessment$bias_score_1990, na.rm = TRUE),
+    sd(bias_assessment$bias_score_2023, na.rm = TRUE)
+  )
+)
+
+ggplot(bias_year_summary) +
+  geom_point(aes(x = mn, y = as.factor(year))) +
+  geom_errorbarh(aes(xmin = mn - sd, xmax = mn + sd, y = as.factor(year))) +
+  labs(x = "Bias score (+/- 1 SD)", y = "", title = "Experts consider enrichment bias to be greater in 1990 than 2029")
+
+```
+
+This imprecision in early years is not ideal, but would not neccesarily influence our mean trends, providing sampling strategy (i.e. what's likely to be sequenced) is the same. However, when we use expert derived estimates of sequencing enrichment bias (i.e. targeting strains likely to exhibit resistance), we see an expectation that bias is greater in 1990 than 2023 i.e. resistant strains were targeted more in early years.
+
+### 2.3.3 Taxonomic domain
+
+Taxonomic coverage is likely to be highly concentrated in a small number of clinically important species. That matters because the data are being used to infer resistance across bacterial diversity, not just within the best-sampled pathogens. This chunk summarises species coverage and plots how sampling is distributed across taxa and over time.
+
+```{r 2_3_3_taxonomic_domain, fig.width=7, fig.height=7}
+# Species-level and species-year coverage diagnostics.
+species_sum <- isolates_clean %>%
+  group_by(species) %>%
+  summarise(N = n(), .groups = "drop") %>%
+  arrange(desc(N))
+
+species_year_sum <- isolates_clean %>%
+  count(species, year, name = "N")
+
+top_species <- species_sum %>% slice_max(N, n = min(20, nrow(species_sum)))
+
+species_plot <- ggplot(top_species) +
+  geom_col(aes(x = reorder(species, N), y = N), fill = "#4c78a8", colour = "white", linewidth = 0.15) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Most sampled species",
+    subtitle = "The distribution is typically highly skewed toward a small number of pathogens.",
+    x = NULL,
+    y = "Isolate count"
+  )
+species_plot
+
+species_heatmap <- ggplot(species_year_sum %>%
+                            semi_join(top_species, by = "species"),
+                          aes(x = year, y = reorder(species, N), fill = N)) +
+  geom_tile(colour = "white", linewidth = 0.15) +
+  scale_fill_viridis_c(option = "C", trans = "sqrt", name = "Count") +
+  labs(
+    title = "Species-by-year coverage",
+    subtitle = "A compact view of how temporal sampling differs across the best-sampled taxa.",
+    x = NULL,
+    y = NULL
+  ) +
+  theme(axis.text.y = element_text(size = 8))
+
+species_heatmap 
+
+```
+
+The taxonomic imbalance is not only a nuisance variable. It is part of the substantive biology of public AMR surveillance: hospitals and public-health systems preferentially target important pathogens, so the sample is structured by clinical concern. That means the taxonomic bias is partly endogenous to the sampling and must be treated as a feature of the data-generating process.
+
+### 2.3.4 Other potential biases
+
+One potential form of perverse bias could be that sampled countries could use antibiotics less, and thus, have lower rates of resistance. To check this, we compare the sampling intensity (isolate count) against antibitoic use across multiple years. Source of antibitoic use data: Browne, A. J. et al. Global antibiotic consumption and usage in humans, 2000--18: a spatial modelling study. Lancet Planet. Health 5, e893--e904 (2021). From this, its apparent there is no clear relationship between sampling intensity and antibiotic use.
+
+```{r 2_3_4_other_potential_biases, fig.width=7, fig.height=7}
+anti <- read.csv("data/anti.csv")
+anti$iso3 <- countrycode(anti$country, "country.name", "iso3c")
+anti$country <- NULL
+
+country_year_sum <- isolates_clean %>%
+  group_by(year, ISO.3) %>%
+  summarise(N = n(), .groups = "drop") %>%
+  left_join(anti, by = c("ISO.3" = "iso3", "year" = "year"))
+
+ggplot(data = country_year_sum[which( #Plot number of samples by antibiotic 
+    country_year_sum$year == 2018 |
+    country_year_sum$year == 2014 |
+    country_year_sum$year == 2010 |
+    country_year_sum$year == 2006),]) +
+  geom_point(aes(x = anti, y = N)) +
+  scale_y_log10() +
+  labs(title = "Antibiotic-use versus sampling intensity",
+    subtitle = "No clear relationship",x = "Antibiotic-use/capita", y = "Isolates sampled") +
+  theme_classic() +
+  facet_wrap(year~.)
+
+```
+
+An additional bias source touched on earlier (temporal domain) is the preferential sequencing of resistant isolates.If resistant isolates are more likely to enter public databases, resistance probabilities estimates will be too high. To assess this, we compare expert-derived expectation of resistance prevalance with expert-derived expectations of enrichment bias (i.e. preferably sequencing resistant isolates). From this, its expected that isolates are more likely to be sampled if they are exhibiting resistance.
+
+```{r 2_3_4_other_potential_biases2, fig.width=7, fig.height=7}
+bias_assessment <- read.csv("data/bias_assessment.csv")
+
+bias_scatter <- ggplot(bias_assessment) +
+  geom_jitter(
+    aes(x = prevalence_score_2023, y = bias_score_2023),
+    alpha = 0.35,
+    colour = "#444444"
+  ) +
+  geom_smooth(
+    aes(x = prevalence_score_2023, y = bias_score_2023),
+    method = "lm",
+    se = TRUE,
+    colour = "#b22222",
+    fill = "#f2b6b6"
+  ) +
+  labs(
+    title = "Expected resistance prevalence versus sequencing bias",
+    subtitle = "Higher expected prevalence is associated with stronger preferential sequencing in the bias assessment.",
+    x = "Expected resistance prevalence",
+    y = "Expected preferential sequencing towards resistant isolates"
+  ) +
+  theme(panel.grid.minor = element_blank())
+
+bias_scatter
+```
+
+### 2.3.5 Mitigation summary
+
+We assume that the resistance patterns observed in genomic databases arise from an underlying resistance process combined with two forms of sampling bias identified through the risk-of-bias assessment. Resistance probability ($R$) represents the underlying probability of resistance in the target population, which we expect to vary across space ($S$), time ($T$) and species according to their phylogenetic relationships ($P$). Although $R$ is generally unknown, structured surveillance programmes provide settings in which it can be estimated from more representative samples. In contrast, observed resistance ($O$) represents the resistance probability within the genomic data and may differ from $R$ because of the sampling process.
+
+We separate this sampling process into coverage and enrichment bias. Coverage bias ($C$) describes where data are available and how much: some countries, bacterial lineages and time periods have been sequenced much more intensively than others. Enrichment bias ($E$) instead describes whether the isolates sampled within these populations are representative with respect to resistance. The risk-of-bias assessment suggests that sequencing practices may preferentially target isolates from pathogens expected to have high resistance or greater clinical importance.
+
+We therefore distinguish the underlying target-population resistance probability ($R$) from the resistance prevalence that researchers or clinicians might expect ($Z$). Expectations about resistance are likely to be informed by the underlying resistance landscape, such that $R$ influences $Z$, while $Z$, together with spatial, phylogenetic and temporal differences in sequencing practices, influences the degree of enrichment bias ($E$). Expected resistance ($Z$) and enrichment bias ($E$) are characterised separately through expert assessment, while structured surveillance programmes provide empirical estimates of $R$. Where these surveillance data overlap with opportunistic genomic observations ($O$), they allow us to calibrate how different levels of expected resistance and enrichment bias distort observed resistance away from the target-population probability.
+
+The DAG therefore separates two distinct sampling problems. Coverage bias determines how well different populations are represented in the genomic data, whereas enrichment bias determines how representative the sampled isolates are within those populations. The correction framework uses these complementary sources of information to recover $R$ from the observed genomic resistance patterns $O$, with coverage and enrichment requiring separate mitigation strategies.
+
+```{r 2_3_5dag, fig.width=7, fig.height=7}
+amr_dag <- dagitty("
+dag {
+
+S -> C
+P -> C
+T -> C
+
+S -> R
+P -> R
+T -> R
+
+R -> Z
+
+S -> E
+P -> E
+T -> E
+Z -> E
+
+R -> O
+E -> O
+
+}
+")
+
+# ------------------------------------------------------------
+# Add readable labels
+# ------------------------------------------------------------
+
+amr_dag_plot <- tidy_dagitty(amr_dag) %>%
+  mutate(
+    label = case_when(
+      name == "S" ~ "Space",
+      name == "P" ~ "Phylogeny",
+      name == "T" ~ "Time",
+      name == "C" ~ "Coverage bias",
+      name == "R" ~ "Target resistance\nprobability",
+      name == "O" ~ "Observed resistance\nprobability",
+      name == "Z" ~ "Expected resistance\nprobability",
+      name == "E" ~ "Enrichment bias"
+    )
+  )
+
+# ------------------------------------------------------------
+# Plot
+# ------------------------------------------------------------
+
+ggplot(
+  amr_dag_plot,
+  aes(x = x, y = y, xend = xend, yend = yend)
+) +
+  geom_dag_edges() +
+  geom_dag_point(size = 8) +
+  geom_dag_text(aes(label = name), size = 3.5) +
+  theme_dag()
+```
+
+For coverage bias, the distribution of genomic observations differs from the distribution of the target population. Some countries, species and time periods contribute many more observations than others. Treating all observations equally would therefore cause resistance estimates to reflect the distribution of the sample rather than the distribution of resistance across the target population. To meet our inferential target---the underlying resistance process across space, time and bacterial diversity---we need to separate this uneven sampling effort from variation in resistance itself. In simple terms, the effective contribution of heavily sampled populations must be reduced relative to sparsely sampled populations, so that inference reflects the target population rather than the availability of genomic observations. Without accounting for this process, highly sequenced countries, species and time periods would disproportionately determine global resistance estimates.
+
+Enrichment bias presents a different problem because it concerns the representativeness of observations within sampled populations rather than the number of observations available. If resistant isolates are preferentially selected for sequencing, the resistance probability observed in genomic data ($O$) may systematically differ from the underlying resistance probability in the target population ($R$). Correcting this bias therefore requires information about the direction and magnitude of this distortion: specifically, how the probability of entering the genomic sample depends on resistance. Increasing sample size or correcting differences in coverage cannot resolve this problem, because a larger non-representative sample remains non-representative. To recover $R$, inference must therefore account for the process that causes observed resistance $O$ to depart from target-population resistance. Without doing so, resistance-dependent sequencing could be incorrectly interpreted as biological variation in resistance prevalence.
+
+## 3 Model trajectories
+
+### 3.1 Structure
+
+#### 3.1.1 Meeting the inferential target
+
+Our inferential target is the underlying probability of resistance in the target population, rather than the resistance frequency within the available genomic sample. We estimate this using a hierarchical binomial model that separates the underlying resistance process from the process that determines how resistance is represented in opportunistically collected genomic data.
+
+For observation $n$, the number of resistant isolates is modelled as
+
+$$
+y_n \sim \text{Binomial}(N_n, p^{\text{obs}}_n),
+$$
+
+where $N_n$ is the number of tested isolates and $p^{\text{obs}}_n$ is the resistance probability represented by the observed genomic data. We distinguish this from the underlying target-population resistance probability, $p^{\text{true}}_n$.
+
+#### 3.1.2 Mitigating coverage bias
+
+Coverage bias arises because the genomic sample is distributed unevenly across countries, bacterial species and time. Rather than estimating resistance by directly averaging the observations available in each year, we model resistance as a continuous process structured across these three dimensions. This separates the estimated resistance trajectory from the particular composition of the genomic sample.
+
+On the log-odds scale, the underlying resistance probability for observation $n$ is
+
+$$
+\eta^{\text{true}}_n =
+\alpha
++
+\mathbf B_n\boldsymbol\beta_{\text{global}}
++
+a^{(P)}_{s[n]}
++
+a^{(S)}_{c[n]}
++
+\mathbf B_n\boldsymbol\beta^{(P)}_{s[n]}
++
+\mathbf B_n\boldsymbol\beta^{(S)}_{c[n]},
+$$
+
+with
+
+$$
+p^{\text{true}}_n =
+\operatorname{logit}^{-1}
+\left(\eta^{\text{true}}_n\right).
+$$
+
+Here, $\alpha$ is the global intercept and $\mathbf B_n\boldsymbol\beta_{\text{global}}$ describes the global temporal trajectory using a spline basis. Species and countries are then allowed to depart from this global trajectory through both intercept differences and differences in their temporal trajectories.
+
+This is important for coverage bias because a heavily sampled country or species does not define a separate component of the global mean simply because it contributes many observations. Instead, its observations inform its position within a hierarchical spatial and evolutionary structure. Poorly sampled countries and species can borrow information from related units, while well-sampled units provide increasingly precise information about their own deviations from the shared process.
+
+The species intercepts are modelled as
+
+$$
+\mathbf a^{(P)}
+=
+\sigma_{P,\alpha}
+\mathbf L_P
+\mathbf z_{P,\alpha},
+\qquad
+\mathbf z_{P,\alpha}\sim N(\mathbf 0,\mathbf I),
+$$
+
+where $\mathbf L_P$ is the Cholesky factor of a phylogenetically structured correlation matrix. This matrix is
+
+$$
+\mathbf K_P
+=
+\lambda_P\mathbf P
++
+(1-\lambda_P)\mathbf I,
+$$
+
+where $\mathbf P$ contains the expected correlation among species from the bacterial phylogeny. The parameter $\lambda_P$ determines how strongly species differences follow phylogenetic relationships. When $\lambda_P$ approaches zero, species are effectively independent; as it approaches one, closely related species are increasingly expected to exhibit similar resistance patterns.
+
+Countries are treated analogously. Their intercepts follow
+
+$$
+\mathbf a^{(S)}
+=
+\sigma_{S,\alpha}
+\mathbf L_S
+\mathbf z_{S,\alpha},
+$$
+
+with
+
+$$
+\mathbf K_S
+=
+\lambda_S\mathbf S
++
+(1-\lambda_S)\mathbf I,
+$$
+
+where $\mathbf S$ describes spatial similarity among countries. Consequently, neighbouring or spatially similar countries can share information rather than every country being treated as an unrelated estimate.
+
+The same structure is applied to temporal change. For each spline coefficient $k$,
+
+$$
+\boldsymbol\beta^{(P)}_k
+=
+\sigma_{P,t}\mathbf L_P\mathbf z^{(P)}_k
+$$
+
+and
+
+$$
+\boldsymbol\beta^{(S)}_k
+=
+\sigma_{S,t}\mathbf L_S\mathbf z^{(S)}_k.
+$$
+
+Species and countries can therefore differ not just in their average resistance probability, but also in how resistance changes through time. These temporal deviations are centred around zero, ensuring that they describe departures from the shared global temporal trajectory rather than shifting the global trajectory itself.
+
+The resulting global component is
+
+$$
+\eta^{\text{global}}_n
+=
+\alpha+\mathbf B_n\boldsymbol\beta_{\text{global}},
+$$
+
+with
+
+$$
+p^{\text{global}}_n
+=
+\operatorname{logit}^{-1}
+\left(\eta^{\text{global}}_n\right).
+$$
+
+This provides the shared resistance trajectory around which spatially and phylogenetically structured variation occurs.
+
+Importantly, this is not equivalent to assigning explicit inverse-sampling weights to individual observations. Instead, coverage bias is mitigated by modelling the process that generated resistance across space, species and time and estimating a shared underlying trajectory rather than treating the empirical distribution of genomic observations as the target population. Future work could explore a doubly robust approach that models the observation process of the coverage bias more explicitly. The hierarchical structure also regularises estimates in sparsely sampled parts of the dataset and prevents poorly supported country- or species-specific trajectories from becoming arbitrarily extreme.
+
+#### 3.1.3 Mitigating enrichment bias
+
+Coverage correction alone is insufficient when the isolates sampled within a country, species and time period are themselves non-representative. We therefore explicitly distinguish the underlying target-population resistance probability from the resistance probability expected in the observed genomic sample.
+
+For structured surveillance observations, sequencing is assumed to provide a substantially more representative estimate of the target population. Their observed linear predictor is therefore simply
+
+$$
+\eta^{\text{obs}}_n
+=
+\eta^{\text{true}}_n.
+$$
+
+For opportunistically sampled genomic observations, we allow enrichment bias to shift the observed resistance probability away from the underlying value:
+
+$$
+\eta^{\text{obs}}_n
+=
+\eta^{\text{true}}_n
++
+\beta_{\text{bias}}B_n,
+$$
+
+where $B_n$ is `bias_excess`, an externally derived measure describing the expected magnitude of resistance enrichment for that observation, and $\beta_{\text{bias}}$ determines how strongly this expected enrichment translates into distortion of the observed resistance probability.
+
+Equivalently,
+
+$$
+p^{\text{obs}}_n
+=
+\operatorname{logit}^{-1}
+\left(
+\eta^{\text{true}}_n
++
+\beta_{\text{bias}}B_n
+\right)
+$$
+
+for opportunistic observations, whereas
+
+$$
+p^{\text{obs}}_n=p^{\text{true}}_n
+$$
+
+for structured surveillance observations.
+
+This distinction is central to the correction. The genomic data contribute information through $p^{\text{obs}}$, because this is the probability generating the observations we actually see. The quantity we ultimately want, however, is $p^{\text{true}}$. The enrichment term provides an explicit mechanism through which the two may differ.
+
+Structured surveillance observations help anchor the underlying resistance process because they enter the likelihood without an enrichment adjustment. Opportunistic observations are interpreted conditional on their expected level of enrichment. The model therefore learns the relationship between expected enrichment and the discrepancy between representative and opportunistic resistance patterns through the shared coefficient $\beta_{\text{bias}}$.
+
+If $\beta_{\text{bias}}$ is positive, increasing expected enrichment moves the resistance probability represented in opportunistic genomic data above the corresponding target-population probability. For example,
+
+$$
+B_n>0,\quad \beta_{\text{bias}}>0
+$$
+
+implies
+
+$$
+p^{\text{obs}}_n > p^{\text{true}}_n.
+$$
+
+Removing the enrichment term then allows us to recover the estimated target-population probability:
+
+$$
+\widehat p^{\text{true}}_n
+=
+\operatorname{logit}^{-1}
+\left(
+\widehat\eta^{\text{true}}_n
+\right).
+$$
+
+The model consequently produces both quantities explicitly. `p_obs` represents the resistance probability expected in the data in the presence of enrichment, whereas `p_true` represents the corresponding resistance probability after removing this sampling distortion.
+
+#### 3.1.4 Combining the two corrections
+
+The two forms of bias are therefore handled at different levels of the data-generating process. Uneven coverage is addressed by modelling resistance as a hierarchical process across space, phylogeny and time, rather than allowing the raw distribution of observations to define the global resistance trajectory. Enrichment is addressed by explicitly modelling the difference between the underlying resistance probability and the probability represented in opportunistically sampled genomic data.
+
+Conceptually, the model can be summarised as
+
+$$
+\text{space + phylogeny + time}
+\longrightarrow
+p^{\text{true}}
+$$
+
+followed by
+
+$$
+p^{\text{true}}+\text{enrichment process}
+\longrightarrow
+p^{\text{obs}},
+$$
+
+with the observed resistance counts generated from $p^{\text{obs}}$. Inference then works backwards from the observed genomic data, using hierarchical spatial, evolutionary and temporal structure together with information on enrichment bias and structured surveillance to estimate the target-population resistance process $p^{\text{true}}$.
+
+```{r 3_1_structure, eval=FALSE}
+stan_code_1 = "data {
+
+  int<lower=1> N;
+  int<lower=1> K_time;
+
+  matrix[N, K_time] B_year;
+
+  array[N] int<lower=0> y;
+  array[N] int<lower=0> trials;
+
+  vector[N] bias_excess;
+  array[N] int<lower=0, upper=1> is_surveillance;
+
+  int<lower=1> N_species;
+  int<lower=1> N_country;
+
+  array[N] int<lower=1, upper=N_species> species_id;
+  array[N] int<lower=1, upper=N_country> country_id;
+
+  matrix[N_species, N_species] phylo_cor;
+  matrix[N_country, N_country] space_cor;
+
+}
+
+transformed data {
+
+  matrix[N_species, N_species] I_species =
+    diag_matrix(rep_vector(1.0, N_species));
+
+  matrix[N_country, N_country] I_country =
+    diag_matrix(rep_vector(1.0, N_country));
+
+}
+
+parameters {
+
+  real alpha;
+
+  real beta_bias;
+
+  vector[K_time] beta_global;
+
+  real<lower=0> sigma_global;
+
+  real<lower=0> sigma_species_intercept;
+  real<lower=0> sigma_country_intercept;
+
+  real<lower=0> sigma_species_time;
+  real<lower=0> sigma_country_time;
+
+  real<lower=0, upper=1> lambda_phylo;
+  real<lower=0, upper=1> lambda_space;
+
+  vector[N_species] z_species_intercept;
+  vector[N_country] z_country_intercept;
+
+  matrix[N_species, K_time] z_species_time;
+  matrix[N_country, K_time] z_country_time;
+
+}
+
+transformed parameters {
+
+  matrix[N_species, N_species] K_phylo =
+    lambda_phylo * phylo_cor +
+    (1 - lambda_phylo) * I_species;
+
+  matrix[N_country, N_country] K_space =
+    lambda_space * space_cor +
+    (1 - lambda_space) * I_country;
+
+  matrix[N_species, N_species] L_phylo =
+    cholesky_decompose(
+      K_phylo +
+      diag_matrix(rep_vector(1e-6, N_species))
+    );
+
+  matrix[N_country, N_country] L_space =
+    cholesky_decompose(
+      K_space +
+      diag_matrix(rep_vector(1e-6, N_country))
+    );
+
+  vector[N_species] alpha_species =
+    sigma_species_intercept *
+    (L_phylo * z_species_intercept);
+
+  vector[N_country] alpha_country =
+    sigma_country_intercept *
+    (L_space * z_country_intercept);
+
+  matrix[N_species, K_time] beta_species;
+  matrix[N_country, K_time] beta_country;
+
+  for (k in 1:K_time) {
+
+    beta_species[, k] =
+      sigma_species_time *
+      (L_phylo * z_species_time[, k]);
+
+    beta_country[, k] =
+      sigma_country_time *
+      (L_space * z_country_time[, k]);
+
+    beta_species[, k] =
+      beta_species[, k] -
+      mean(beta_species[, k]);
+
+    beta_country[, k] =
+      beta_country[, k] -
+      mean(beta_country[, k]);
+
+  }
+
+}
+
+model {
+
+  vector[N] eta_true;
+  vector[N] eta_obs;
+
+  alpha ~ normal(0, 2.5);
+
+  beta_bias ~ normal(0, 1);
+
+  sigma_global ~ exponential(1);
+  beta_global ~ normal(0, sigma_global);
+
+  sigma_species_intercept ~ exponential(5);
+  sigma_country_intercept ~ exponential(5);
+
+  sigma_species_time ~ normal(0, 0.1);
+  sigma_country_time ~ normal(0, 0.1);
+
+  lambda_phylo ~ beta(1, 1);
+  lambda_space ~ beta(1, 1);
+
+  z_species_intercept ~ normal(0, 1);
+  z_country_intercept ~ normal(0, 1);
+
+  to_vector(z_species_time) ~ normal(0, 1);
+  to_vector(z_country_time) ~ normal(0, 1);
+
+  for (n in 1:N) {
+
+    eta_true[n] =
+      alpha +
+      B_year[n] * beta_global +
+      alpha_species[species_id[n]] +
+      alpha_country[country_id[n]] +
+      B_year[n] * beta_species[species_id[n]]' +
+      B_year[n] * beta_country[country_id[n]]';
+
+    eta_obs[n] = eta_true[n];
+
+    if (is_surveillance[n] == 0) {
+      eta_obs[n] =
+        eta_obs[n] +
+        beta_bias * bias_excess[n];
+    }
+
+  }
+
+  y ~ binomial_logit(
+    trials,
+    eta_obs
+  );
+
+}
+
+generated quantities {
+
+  vector[N] eta_true;
+  vector[N] eta_obs;
+
+  vector[N] p_true;
+  vector[N] p_obs;
+
+  vector[N] eta_global;
+  vector[N] p_global;
+
+  vector[N] log_lik;
+
+  for (n in 1:N) {
+
+    eta_global[n] =
+      alpha +
+      B_year[n] * beta_global;
+
+    eta_true[n] =
+      eta_global[n] +
+      alpha_species[species_id[n]] +
+      alpha_country[country_id[n]] +
+      B_year[n] * beta_species[species_id[n]]' +
+      B_year[n] * beta_country[country_id[n]]';
+
+    eta_obs[n] = eta_true[n];
+
+    if (is_surveillance[n] == 0) {
+      eta_obs[n] =
+        eta_obs[n] +
+        beta_bias * bias_excess[n];
+    }
+
+    p_global[n] = inv_logit(eta_global[n]);
+    p_true[n] = inv_logit(eta_true[n]);
+    p_obs[n] = inv_logit(eta_obs[n]);
+
+    log_lik[n] =
+      binomial_logit_lpmf(
+        y[n] |
+        trials[n],
+        eta_obs[n]
+      );
+
+  }
+
+}"
+
+```
+
+### 3.2 Prepare data
+
+Joins the bias scores to the cleaned data and prepares the final modelling subset.
+
+```{r 3_2_filter_and_prepare}
+isolates_clean <- isolates_clean %>%
+  left_join(bias_assessment %>% select(ISO.3, species, bias_score_1990, bias_score_2023), by = c("ISO.3", "species")) %>%
+  mutate(
+    bias_score_1990 = replace_na(bias_score_1990, 1), #Less sampled species not covered by bias assessment, considered unlikely to experience targetted sampling
+    bias_score_2023 = replace_na(bias_score_2023, 1),
+    year_prop = pmin(pmax((year - 1990) / (2023 - 1990), 0), 1),
+    bias_score = bias_score_1990 + year_prop * (bias_score_2023 - bias_score_1990))  %>%
+  filter(
+    ISO.3 %in% country_years$ISO.3[country_years$year_n > 2],
+    species %in% species_years$species[species_years$year_n > 2]
+  )
+  
+
+dat_all <- isolates_clean %>%
+  group_by(
+    species,
+    gram,
+    ISO.3,
+    year,
+    bias_score,
+    is_surveillance
+  ) %>%
+  summarise(
+    centroid_lat = mean(centroid_lat, na.rm = TRUE),
+    centroid_lon = mean(centroid_lon, na.rm = TRUE),
+    trials = n(),
+    across(all_of(ab_list), ~ sum(.x == 1, na.rm = TRUE)), .groups = "drop"
+  ) 
+
+dat_gram_pos <- dat_all %>%
+  filter(gram == "Gram-positive")
+
+dat_gram_neg <- dat_all %>%
+  filter(gram == "Gram-negative")
+
+stan_input_1 <- list(
+  combined = prep_data(dat_all, phylo),
+  gram_positive = prep_data(dat_gram_pos, phylo),
+  gram_negative = prep_data(dat_gram_neg, phylo)
+)
+
+```
+
+### 3.3 Compile and run
+
+Writes the Stan program to disk, compiles the model, and loads the fitted model objects.
+
+```{r 3_3_compile_and_run, eval=FALSE}
+writeLines(
+  stan_code_1,
+  "outputs/amr_model.stan"
+)
+
+mod <- cmdstanr::cmdstan_model(
+  "outputs/amr_model.stan"
+)
+
+init_fun_1 <- function() {
+  list(
+    alpha = 0,
+    beta_bias = 0.1,
+    beta_global = rep(0, stan_data$K_time),
+    lambda_phylo = 0.2,
+    lambda_space = 0.2,
+    sigma_global = 0.5,
+    sigma_species_intercept = 0.1,
+    sigma_country_intercept = 0.1,
+    sigma_species_time = 0.02,
+    sigma_country_time = 0.02,
+    z_species_intercept = rep(0, stan_data$N_species),
+    z_country_intercept = rep(0, stan_data$N_country),
+    z_species_time = matrix(0, stan_data$N_species, stan_data$K_time),
+    z_country_time = matrix(0, stan_data$N_country, stan_data$K_time)
+  )
+}
+
+for (abx in ab_list[5]) {
+  message("Starting fit: ", abx)
+  input_key <- dplyr::case_when(
+    abx == "Polymyxins" ~ "gram_negative",
+    abx == "Oxazolidinones" ~ "gram_positive",
+    TRUE ~ "combined"
+  )
+  input_ab <- stan_input_1[[input_key]]
+  stan_data <- list(
+    N = nrow(input_ab$dat),
+    K_time = ncol(input_ab$B_year),
+    B_year = input_ab$B_year,
+    y = as.integer(input_ab$dat[[abx]]),
+    trials = as.integer(input_ab$dat$trials),
+    bias_excess = as.numeric(input_ab$dat$bias_score - 1),
+    is_surveillance = as.integer(input_ab$dat$is_surveillance),
+    N_species = nrow(input_ab$phylo_cor),
+    N_country = nrow(input_ab$space_cor),
+    species_id = input_ab$dat$species_id,
+    country_id = input_ab$dat$country_id,
+    phylo_cor = input_ab$phylo_cor,
+    space_cor = input_ab$space_cor
+  )
+#  fit <- mod$sample(
+#    data = stan_data,
+#    init = init_fun_1,
+#    chains = 6,
+#    parallel_chains = 6,
+#    iter_warmup = 500,
+#    iter_sampling = 500,
+#    adapt_delta = 0.95,
+#    max_treedepth = 12,
+#    seed = 123,
+#    refresh = 10
+#  )
+#  fit$save_object(
+#    file = file.path(
+#      paste0("outputs/fit_", abx, ".rds")
+#    )
+#  )
+  message("Finished fit: ", abx, " using ", input_key)
+}
+```
+
+### 3.4 Diagnostics
+
+Collects convergence diagnostics from each fitted model and summarises sampler performance. All models converge. 
+
+Also extracts posterior estimates of \(\beta_{\text{bias}}\), representing the enrichment correction. At the 95% credible interval, enrichment bias had a positive effect for four antimicrobial classes, such that increasingly targeted or non-representative sequencing was associated with higher observed resistance than expected from the underlying population-level resistance probability. This is consistent with preferential sequencing of isolates suspected to be resistant, with the correction reducing observed resistance estimates towards the inferred underlying prevalence. Surprisingly, for two antimicrobial classes—Oxazolidinones and Trimethoprim—the enrichment correction was negative, indicating that more strongly enriched sampling was associated with lower observed resistance than expected from the underlying resistance trajectory. In these cases, the assumed enrichment process may not reflect preferential sequencing of resistant isolates, or the bias score may be capturing other structured differences in surveillance and sequencing practice that act in the opposite direction. These negative effects should therefore be interpreted cautiously rather than as evidence of conventional resistance enrichment. An absence of an effect suggests the surveilance data we used, which is very limited (!), is not meaningfully different from the opportunistic genomic sample. This may mean the genomic sample is representative of target population, or the survielance data is not.
+
+```{r 3_4_diagnostics, warning=FALSE, message=FALSE}
+
+fit_files <- list.files(
+  path = "outputs",
+  pattern = "^fit_.*\\.rds$",
+  full.names = TRUE
+)
+
+key_parameters <- c(
+  "alpha",
+  "beta_bias",
+  "sigma_global",
+  "sigma_species_intercept",
+  "sigma_country_intercept",
+  "sigma_species_time",
+  "sigma_country_time",
+  "lambda_phylo",
+  "lambda_space"
+)
+
+fit_diagnostics <- purrr::map_dfr(
+  fit_files,
+  function(fit_file) {
+    
+    antibiotic <- basename(fit_file) %>%
+      stringr::str_remove("^fit_") %>%
+      stringr::str_remove("\\.rds$")
+    
+    fit <- readRDS(fit_file)
+    
+    fit$summary(
+      variables = key_parameters
+    ) %>%
+      dplyr::select(
+        variable, mean, sd, rhat, ess_bulk, ess_tail
+      ) %>%
+      dplyr::mutate(
+        antibiotic = antibiotic,
+        .before = 1
+      )
+    
+  }
+)
+
+diagnostic_summary <- fit_diagnostics %>%
+  dplyr::group_by(antibiotic) %>%
+  dplyr::summarise(
+    max_rhat = max(rhat, na.rm = TRUE),
+    min_bulk_ess =
+      min(ess_bulk, na.rm = TRUE),
+    min_tail_ess =
+      min(ess_tail, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(desc(max_rhat))
+
+diagnostic_summary
+
+# Extract posterior draws for enrichment-bias effect
+
+beta_bias_draws <- purrr::map_dfr(
+  fit_files,
+  function(fit_file) {
+    
+    antibiotic <- basename(fit_file) %>%
+      stringr::str_remove("^fit_") %>%
+      stringr::str_remove("\\.rds$")
+    
+    fit <- readRDS(fit_file)
+    
+    fit$draws(
+      variables = "beta_bias",
+      format = "df"
+    ) %>%
+      dplyr::select(beta_bias) %>%
+      dplyr::mutate(
+        antibiotic = antibiotic
+      )
+  }
+) %>%
+  dplyr::mutate(
+    antibiotic = factor(
+      antibiotic,
+      levels = ab_list
+    )
+  )
+
+
+# Plot posterior distributions
+
+ggplot(
+  beta_bias_draws,
+  aes(x = beta_bias)
+) +
+  geom_histogram(
+    bins = 40,
+    fill = "grey60",
+    colour = "white"
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed"
+  ) +
+  facet_wrap(
+    ~ antibiotic,
+    ncol = 4,
+    scales = "free"
+  ) +
+  labs(
+    x = expression(beta[bias]),
+    y = "Posterior draws"
+  ) +
+  theme_classic() +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+
+beta_bias_summary <- beta_bias_draws %>%
+  dplyr::group_by(antibiotic) %>%
+  dplyr::summarise(
+    mean = mean(beta_bias),
+    
+    `50% lower` = quantile(beta_bias, 0.25),
+    `50% upper` = quantile(beta_bias, 0.75),
+    
+    `80% lower` = quantile(beta_bias, 0.10),
+    `80% upper` = quantile(beta_bias, 0.90),
+    
+    `95% lower` = quantile(beta_bias, 0.025),
+    `95% upper` = quantile(beta_bias, 0.975),
+    
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(antibiotic) %>%
+  dplyr::mutate(
+    dplyr::across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+beta_bias_summary
+```
+
+### 3.5 Global trajectories
+
+Denerates the global resistance draws, summarises uncertainty for key years, and plots both the absolute and fold-change trajectories.
+
+```{r 3_5_global_trajectories, fig.width=7, fig.height=7}
+
+global_smooth_draws <- purrr::map_dfr(
+  fit_files,
+  \(f) {
+
+    ab <- basename(f) %>%
+      stringr::str_remove("^fit_") %>%
+      stringr::str_remove("\\.rds$")
+
+    message("Global smooth draws for: ", ab)
+
+    input_key <- dplyr::case_when(
+      ab == "Polymyxins" ~ "gram_negative",
+      ab == "Oxazolidinones" ~ "gram_positive",
+      TRUE ~ "combined"
+    )
+
+    input_ab <- stan_input_1[[input_key]]
+
+    year_z_pred <- (analysis_years - input_ab$year_center) /
+      input_ab$year_scale
+
+    sc_pred <- mgcv::PredictMat(
+      input_ab$sc,
+      data.frame(year_z = year_z_pred)
+    )
+
+    B_pred <- scale(
+      sc_pred,
+      center = attr(input_ab$B_year, "scaled:center"),
+      scale = attr(input_ab$B_year, "scaled:scale")
+    )
+
+    fit <- readRDS(f)
+
+    draws <- fit$draws(
+      variables = c("alpha", "beta_global"),
+      format = "matrix"
+    )
+
+    alpha <- draws[, "alpha"]
+
+    beta_global <- draws[
+      ,
+      grep("^beta_global\\[", colnames(draws)),
+      drop = FALSE
+    ]
+
+    eta <- sweep(
+      beta_global %*% t(B_pred),
+      1,
+      alpha,
+      "+"
+    )
+
+    p <- plogis(eta)
+
+    tibble::tibble(
+      antibiotic = ab,
+      draw_id = rep(seq_len(nrow(p)), times = length(analysis_years)),
+      year = rep(analysis_years, each = nrow(p)),
+      p = as.vector(p)
+    )
+  }
+)
+
+global_smooth_predictions <- global_smooth_draws %>%
+  dplyr::group_by(
+    antibiotic,
+    year
+  ) %>%
+  dplyr::summarise(
+    q025 = quantile(p, 0.025),
+    q10  = quantile(p, 0.10),
+    q25  = quantile(p, 0.25),
+    q50  = quantile(p, 0.50),
+    q75  = quantile(p, 0.75),
+    q90  = quantile(p, 0.90),
+    q975 = quantile(p, 0.975),
+    .groups = "drop"
+  )
+
+global_scatter <- global_smooth_predictions %>%
+  dplyr::filter(year %in% c(1990, 2023)) %>%
+  dplyr::select(antibiotic, year, q025, q10, q25, q50, q75, q90, q975) %>%
+  tidyr::pivot_wider(
+    names_from = year,
+    values_from = c(q025, q10, q25, q50, q75, q90, q975),
+    names_glue = "{.value}_{year}"
+  )
+
+
+global_scatter_log <- global_scatter %>%
+  dplyr::mutate(
+    x50 = log10(pmax(q50_1990, p_min)),
+    y50 = log10(pmax(q50_2023, p_min)),
+    x25 = log10(pmax(q25_1990, p_min)),
+    x75 = log10(pmax(q75_1990, p_min)),
+    y25 = log10(pmax(q25_2023, p_min)),
+    y75 = log10(pmax(q75_2023, p_min))
+  )
+
+global_probability_shift_plot <- ggplot() +
+  geom_raster(
+    data = bi_background_log_df,
+    aes(x = x, y = y, fill = fill)
+  ) +
+  scale_fill_identity() +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dashed",
+    linewidth = 0.35,
+    colour = "grey5"
+  ) +
+  geom_errorbar(
+    data = global_scatter_log,
+    aes(x = x50, ymin = y25, ymax = y75),
+    width = 0,
+    linewidth = 0.25,
+    alpha = 0.85, colour = "white"
+  ) +
+  geom_errorbarh(
+    data = global_scatter_log,
+    aes(y = y50, xmin = x25, xmax = x75),
+    height = 0,
+    linewidth = 0.25,
+    alpha = 0.85, colour = "white"
+  ) +
+  geom_point(
+    data = global_scatter_log,
+    aes(x = x50, y = y50),
+    shape = 21,
+    size = 2.7,
+    fill = "white",
+    colour = "black",
+    stroke = 0.35
+  ) +
+  scale_x_continuous(
+    limits = log10(c(p_min, 1)),
+    breaks = log10(log_breaks),
+    labels = log_labels,
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    limits = log10(c(p_min, 1)),
+    breaks = log10(log_breaks),
+    labels = log_labels,
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = "Resistance in 1990",
+    y = "Resistance in 2023"
+  ) +
+  coord_equal(clip = "off") +
+  theme_classic(base_size = 8, base_family = "sans") +
+  theme(
+    plot.margin = margin(8, 8, 8, 8)
+  )
+
+global_probability_shift_plot
+
+ggsave(
+  "outputs/global_probability_shift.pdf",
+  global_probability_shift_plot,
+  width = 8.9,
+  height = 8.9,
+  units = "cm",
+  device = cairo_pdf
+)
+
+# -----------------------------
+# Relative change in resistance since 1990
+# -----------------------------
+
+global_sig <- global_scatter %>%
+  dplyr::mutate(
+    sig_label = dplyr::case_when(
+      q025_2023 > q975_1990 ~ "***",
+      q10_2023  > q90_1990  ~ "**",
+      q25_2023  > q75_1990  ~ "*",
+      TRUE ~ ""
+    )
+  ) %>%
+  dplyr::select(antibiotic, sig_label)
+
+global_trajectory <- global_smooth_predictions %>%
+  dplyr::left_join(global_sig, by = "antibiotic") %>%
+  dplyr::group_by(antibiotic) %>%
+  dplyr::mutate(
+    base_q50 = q50[which.min(abs(year - 1990))],
+    prob_fc = q50 / pmax(base_q50, 1e-9),
+    log10_prob_fc = log10(prob_fc)
+  ) %>%
+  dplyr::ungroup()
+
+global_label <- global_trajectory %>%
+  dplyr::group_by(antibiotic) %>%
+  dplyr::filter(year == max(year)) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(dplyr::desc(log10_prob_fc)) %>%
+  dplyr::mutate(
+    label = paste0(antibiotic, sig_label),
+    label_y = seq(
+      from = max(log10_prob_fc, na.rm = TRUE),
+      to = min(log10_prob_fc, na.rm = TRUE),
+      length.out = dplyr::n()
+    ),
+    x_lab = 2025
+  )
+global_label$antibiotic
+
+global_relative_change_plot <- ggplot(
+  global_trajectory,
+  aes(year, log10_prob_fc, group = antibiotic)
+) +
+  geom_line(
+    linetype = "dashed",
+    linewidth = 0.25,
+    alpha = 0.95,
+    colour = "grey20"
+  ) +
+  annotate(
+    "text",
+    x = 1991,
+    y = 3.95,
+    hjust = 0,
+    vjust = 1,
+    family = "sans",
+    size = 2.7,
+    label = "*** 95%\n** 80%\n* 50%"
+  ) +
+  scale_x_continuous(
+    breaks = c(1990, 2000, 2010, 2020),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    breaks = c(-1, 0, 1, 2, 3, 4),
+    labels = c("0.1x","1×", "10×", "100×", "1000×", "10000x")
+  ) +
+  coord_cartesian(
+    xlim = c(1990, 2023),
+    ylim = c(-1, 4),
+    clip = "off"
+  ) +
+  labs(
+    x = "Year",
+    y = "Fold-change in resistance probability since 1990"
+  ) +
+  theme_classic(base_size = 11, base_family = "sans") +
+  theme(
+    plot.margin = margin(8, 95, 8, 8)
+  )
+
+global_relative_change_plot
+
+ggsave(
+  "outputs/global_relative_change.pdf",
+  global_relative_change_plot,
+  width = 11.9,
+  height = 15.9,
+  units = "cm",
+  device = cairo_pdf
+)
+
+global_scatter2 <- global_smooth_predictions %>%
+  dplyr::filter(year %in% c(1990, 2015)) %>%
+  dplyr::select(antibiotic, year, q025, q10, q25, q50, q75, q90, q975) %>%
+  tidyr::pivot_wider(
+    names_from = year,
+    values_from = c(q025, q10, q25, q50, q75, q90, q975),
+    names_glue = "{.value}_{year}"
+  )
+
+global_sig2 <- global_scatter2 %>%
+  dplyr::mutate(
+    sig_label = dplyr::case_when(
+      q025_2015 > q975_1990 ~ "***",
+      q10_2015  > q90_1990  ~ "**",
+      q25_2015  > q75_1990  ~ "*",
+      TRUE ~ ""
+    )
+  ) %>%
+  dplyr::select(antibiotic, sig_label)
+
+global_order <- global_smooth_predictions %>%
+  dplyr::filter(year == 2023) %>%
+  dplyr::arrange(dplyr::desc(q50)) %>%
+  dplyr::pull(antibiotic)
+global_order
+
+```
+
+### 3.6 Variance partitioning
+
+Checks the variance components that govern species and country partial pooling and records the phylogenetic and spatial contributions.
+
+```{r 3_6_variance_partitioning}
+#Range of variance captured by species vs country intercepts
+range((fit_diagnostics$mean[fit_diagnostics$variable == "sigma_species_intercept"]^2)/(fit_diagnostics$mean[fit_diagnostics$variable == "sigma_country_intercept"])^2)
+
+#Median of variance captured by species vs country intercepts
+median((fit_diagnostics$mean[fit_diagnostics$variable == "sigma_species_intercept"]^2)/(fit_diagnostics$mean[fit_diagnostics$variable == "sigma_country_intercept"])^2)
+
+#Range of variance captured by species vs country spline
+range((fit_diagnostics$mean[fit_diagnostics$variable == "sigma_species_time"]^2)/(fit_diagnostics$mean[fit_diagnostics$variable == "sigma_country_time"])^2)
+
+#Median of variance captured by species vs country spline
+median((fit_diagnostics$mean[fit_diagnostics$variable == "sigma_species_time"]^2)/(fit_diagnostics$mean[fit_diagnostics$variable == "sigma_country_time"])^2)
+
+#Median of variance captured by species intercept vs species spline
+median((fit_diagnostics$mean[fit_diagnostics$variable == "sigma_species_intercept"]^2)/(fit_diagnostics$mean[fit_diagnostics$variable == "sigma_species_time"])^2)
+
+#Median of variance captured by country intercept vs country spline
+median((fit_diagnostics$mean[fit_diagnostics$variable == "sigma_country_intercept"]^2)/(fit_diagnostics$mean[fit_diagnostics$variable == "sigma_country_time"])^2)
+
+#Phylogentic contribution (1 = complete; 0 = independent)
+range((fit_diagnostics$mean[fit_diagnostics$variable == "lambda_phylo"]))
+median((fit_diagnostics$mean[fit_diagnostics$variable == "lambda_phylo"]))
+
+#Spatical contribution (1 = complete; 0 = independent)
+range((fit_diagnostics$mean[fit_diagnostics$variable == "lambda_space"]))
+median((fit_diagnostics$mean[fit_diagnostics$variable == "lambda_space"]))
+
+```
+
+### 3.7 Species
+
+#### 3.7.1 Trajectories
+
+Predicts species-level resistance trajectories, combines them with phylogenetic context, and builds the main species comparison panel.
+
+```{r 3_7_1_trajectories, fig.width=7, fig.height=11}
+
+
+all_species_gram <- stan_input_1$combined$dat %>%
+  dplyr::distinct(species, gram)
+
+species_smooth_draws <- purrr::map_dfr(
+  fit_files,
+  \(f) {
+
+    ab <- basename(f) %>%
+      stringr::str_remove("^fit_") %>%
+      stringr::str_remove("\\.rds$")
+
+    message("Predicting species-year draws for: ", ab)
+
+    input_key <- dplyr::case_when(
+      ab == "Polymyxins" ~ "gram_negative",
+      ab == "Oxazolidinones" ~ "gram_positive",
+      TRUE ~ "combined"
+    )
+
+    input_ab <- stan_input_1[[input_key]]
+
+    year_z_pred <- (analysis_years - input_ab$year_center) /
+      input_ab$year_scale
+
+    sc_pred <- mgcv::PredictMat(
+      input_ab$sc,
+      data.frame(year_z = year_z_pred)
+    )
+
+    B_pred <- scale(
+      sc_pred,
+      center = attr(input_ab$B_year, "scaled:center"),
+      scale = attr(input_ab$B_year, "scaled:scale")
+    )
+
+    colnames(B_pred) <- colnames(input_ab$B_year)
+    rownames(B_pred) <- as.character(analysis_years)
+
+    species_obs <- input_ab$species_levels
+
+    fit <- readRDS(f)
+
+    draws <- fit$draws(
+      variables = c(
+        "alpha",
+        "beta_global",
+        "alpha_species",
+        "beta_species"
+      ),
+      format = "matrix"
+    )
+
+    alpha <- draws[, "alpha"]
+
+    beta_global <- draws[
+      ,
+      grep("^beta_global\\[", colnames(draws)),
+      drop = FALSE
+    ]
+
+    alpha_species <- draws[
+      ,
+      grep("^alpha_species\\[", colnames(draws)),
+      drop = FALSE
+    ]
+
+    modelled_draws <- purrr::map_dfr(
+      seq_along(species_obs),
+      \(s) {
+
+        beta_species_s <- draws[
+          ,
+          grep(
+            paste0("^beta_species\\[", s, ","),
+            colnames(draws)
+          ),
+          drop = FALSE
+        ]
+
+        eta <- sweep(
+          beta_global %*% t(B_pred),
+          1,
+          alpha + alpha_species[, s],
+          "+"
+        ) +
+          beta_species_s %*% t(B_pred)
+
+        p <- plogis(eta)
+
+        tibble::tibble(
+          antibiotic = ab,
+          species = species_obs[s],
+          draw_id = rep(seq_len(nrow(p)), times = length(analysis_years)),
+          year = rep(analysis_years, each = nrow(p)),
+          p = as.vector(p),
+          source = "modelled"
+        )
+      }
+    ) %>%
+      dplyr::left_join(all_species_gram, by = "species") %>%
+      dplyr::select(
+        antibiotic,
+        species,
+        gram,
+        year,
+        draw_id,
+        p,
+        source
+      )
+
+    hardcoded_gram <- dplyr::case_when(
+      ab == "Oxazolidinones" ~ "Gram-negative",
+      ab == "Polymyxins" ~ "Gram-positive",
+      TRUE ~ NA_character_
+    )
+
+    if (!is.na(hardcoded_gram)) {
+
+      intrinsic_draws <- all_species_gram %>%
+        dplyr::filter(gram == hardcoded_gram) %>%
+        tidyr::crossing(
+          year = analysis_years,
+          draw_id = seq_len(nrow(draws))
+        ) %>%
+        dplyr::mutate(
+          antibiotic = ab,
+          p = 1,
+          source = "intrinsic"
+        ) %>%
+        dplyr::select(
+          antibiotic,
+          species,
+          gram,
+          year,
+          draw_id,
+          p,
+          source
+        )
+
+      dplyr::bind_rows(
+        modelled_draws,
+        intrinsic_draws
+      )
+
+    } else {
+
+      modelled_draws
+    }
+  }
+)
+
+species_smooth_predictions <- species_smooth_draws %>%
+  dplyr::group_by(
+    antibiotic,
+    species,
+    gram,
+    year,
+    source
+  ) %>%
+  dplyr::summarise(
+    q025 = quantile(p, 0.025),
+    q10  = quantile(p, 0.10),
+    q25  = quantile(p, 0.25),
+    q50  = quantile(p, 0.50),
+    q75  = quantile(p, 0.75),
+    q90  = quantile(p, 0.90),
+    q975 = quantile(p, 0.975),
+    .groups = "drop"
+  )
+
+tree_plot <- ape::keep.tip(
+  phylo,
+  intersect(
+    phylo$tip.label,
+    unique(species_smooth_predictions$species)
+  )
+)
+tree_plot$tip.label <- short_species_label(tree_plot$tip.label)
+species_smooth_predictions$species <- short_species_label(species_smooth_predictions$species)
+
+species_predictions_plot <- species_smooth_predictions %>%
+  dplyr::filter(year %in% c(1990, 2023)) %>%
+  dplyr::select(species, antibiotic, year, q50) %>%
+  tidyr::pivot_wider(
+    names_from = year,
+    values_from = q50,
+    names_prefix = "p_"
+  ) %>%
+  dplyr::mutate(
+    x = log10(pmax(p_1990, p_min)),
+    y = log10(pmax(p_2023, p_min)),
+    x01 = scales::rescale(x, from = c(log10(p_min), 0), to = c(0, 1)),
+    y01 = scales::rescale(y, from = c(log10(p_min), 0), to = c(0, 1)),
+    bi_colour = bi_colour_continuous(
+      x = x01,
+      y = y01,
+      palette_bi = palette_bi
+    )
+  )
+
+tile_df_bi <- species_predictions_plot %>%
+  dplyr::select(species, antibiotic, bi_colour) %>%
+  tidyr::pivot_wider(
+    names_from = antibiotic,
+    values_from = bi_colour
+  ) %>%
+  dplyr::mutate(
+    species_label = short_species_label(species)
+  ) %>%
+  dplyr::select(
+    species_label,
+    dplyr::all_of(as.character(global_order))
+  ) %>%
+  tibble::column_to_rownames("species_label")
+
+tile_df_bi <- tile_df_bi[
+  tree_plot$tip.label,,drop = FALSE]
+
+species_phylogeny_plot <- ggtree::ggtree(
+  tree_plot,
+  layout = "circular",
+  size = 0.3,
+  colour = "grey10"
+) +
+  ggtree::geom_tiplab2(
+    size = 1.25,
+    align = TRUE,
+    linetype = "dotted",
+    linesize = 0.15,
+    colour = "grey50",
+    offset = 0
+  )
+
+species_phylogeny_plot <- ggtree::gheatmap(
+  species_phylogeny_plot,
+  tile_df_bi,
+  offset = 0.95,
+  width = 1.25,
+  colnames = FALSE,
+  color = "grey87"
+) +
+  ggplot2::scale_fill_identity(na.value = "white") +
+  ggplot2::theme(legend.position = "none")
+
+species_phylogeny_plot <- ggtree::open_tree(
+  species_phylogeny_plot,
+  angle = 20
+)
+
+species_phylogeny_plot <- ggtree::rotate_tree(
+  species_phylogeny_plot,
+  angle = 100
+)
+
+scatter_df <- species_smooth_predictions %>%
+  dplyr::filter(
+    antibiotic %in% ab_list,
+    year %in% c(1990, 2023)
+  ) %>%
+  dplyr::select(species, antibiotic, year, q50) %>%
+  tidyr::pivot_wider(
+    names_from = year,
+    values_from = q50,
+    names_prefix = "p_"
+  ) %>%
+  dplyr::mutate(
+    antibiotic = factor(antibiotic, levels = ab_list),
+    species_label = short_species_label(species),
+    log_p_1990 = log10(pmax(p_1990, p_min)),
+    log_p_2023 = log10(pmax(p_2023, p_min)),
+    above_diag = p_2023 >= p_1990
+  )
+
+hospital_priority_species <- c(
+  "E. faecium",
+  "S. aureus",
+  "K. pneumoniae",
+  "A. baumannii",
+  "P. aeruginosa",
+  "E. cloacae"
+)
+
+ab_show <- c(
+  "Betalactams",
+  "Quinolones",
+  "Polymyxins"
+)
+
+scatter_subset_df <- scatter_df %>%
+  mutate(
+    hospital_priority = species %in% hospital_priority_species
+  ) %>%
+  dplyr::filter(
+    antibiotic %in% ab_show
+  ) %>%
+  mutate(
+    antibiotic = factor(antibiotic, levels = ab_show)
+  )
+
+species_trajectory_scatter_plot <- ggplot() +
+  geom_raster(
+    data = bi_background_log_df,
+    aes(x = x, y = y, fill = fill)
+  ) +
+  scale_fill_identity() +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linewidth = 0.3,
+    linetype = "dashed",
+    colour = "grey20"
+  ) +
+  geom_point(
+    data = subset(scatter_subset_df, !hospital_priority),
+    aes(log_p_1990, log_p_2023),
+    shape = 21,
+    size = 1.5,
+    fill = "white",
+    colour = "black",
+    alpha = 0.5,
+    stroke = 0.2
+  ) +
+  geom_point(
+    data = subset(scatter_subset_df, hospital_priority),
+    aes(log_p_1990, log_p_2023),
+    shape = 21,
+    size = 2,
+    fill = "white",
+    colour = "black",
+    alpha = 5,
+    stroke = 0.8
+  ) +
+  facet_wrap(
+    ~ antibiotic,
+    nrow = 1
+  ) +
+  scale_x_continuous(
+    limits = log10(c(p_min, 1.1)),
+    breaks = log10(log_breaks),
+    labels = log_labels,
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    limits = log10(c(p_min, 1.1)),
+    breaks = log10(log_breaks),
+    labels = log_labels,
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = "Resistance in 1990",
+    y = "Resistance in 2023"
+  ) +
+  coord_fixed(clip = "off") +
+  theme_classic(base_size = 8, base_family = "sans") +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 8),
+    panel.spacing = unit(0.9, "lines"),
+    axis.text = element_text(size = 6),
+    axis.title = element_text(size = 8)
+  )
+
+species_structure_panel <- species_phylogeny_plot / species_trajectory_scatter_plot +
+  plot_layout(
+    heights = c(3.5, 1)
+  ) 
+species_structure_panel
+
+ggsave(
+  filename = "outputs/species_structure_panel.pdf",
+  plot = species_structure_panel,
+  device = grDevices::cairo_pdf,
+  width = 18.3,
+  height = 24.7,
+  units = "cm"
+)
+
+```
+
+#### 3.7.2 Species pairwise trajectory grid
+
+Plots the full species-by-antibiotic trajectory grid and labels how many species lie above the 1990-2023 diagonal in each panel.
+
+```{r 3_7_2_species_pairwise_trajectory_grid, fig.width=7, fig.height=11}
+
+# ============================================================
+# Species bivariate scatter faceted by antibiotic
+# Counts species above diagonal: p_2023 > p_1990
+# ============================================================
+
+diag_counts_df <- scatter_df %>%
+  dplyr::group_by(antibiotic) %>%
+  dplyr::summarise(
+    n_total = dplyr::n(),
+    n_above = sum(above_diag, na.rm = TRUE),
+    pct_above = 100 * n_above / n_total,
+    label = paste0(
+      "N = ", n_above, "/", n_total,
+      " (", round(pct_above), "%)"
+    ),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    x = log10(1e-4),
+    y = log10(1)
+  )
+
+species_trajectory_grid <- ggplot() +
+  geom_raster(
+    data = bi_background_log_df,
+    aes(
+      x = x,
+      y = y,
+      fill = fill
+    )
+  ) +
+  scale_fill_identity() +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linewidth = 0.25,
+    linetype = "dashed",
+    colour = "grey25"
+  ) +
+  geom_point(
+    data = scatter_df,
+    aes(
+      x = log_p_1990,
+      y = log_p_2023
+    ),
+    shape = 21,
+    size = 1.2,
+    fill = "white",
+    colour = "black",
+    alpha = 0.65,
+    stroke = 0.18
+  ) +
+  geom_text(
+    data = diag_counts_df,
+    aes(
+      x = x,
+      y = y,
+      label = label
+    ),
+    inherit.aes = FALSE,
+    hjust = -0.1,
+    vjust = 1.5,
+    size = 2.4,
+    colour = "white"
+  ) +
+  facet_wrap(
+    ~ antibiotic,
+    ncol = 4
+  ) +
+  scale_x_continuous(
+    limits = log10(c(1e-4, 1)),
+    breaks = log10(c(1e-4, 1e-3, 1e-2, 1e-1, 1)),
+    labels = c(
+      "0.0001",
+      "0.001",
+      "0.01",
+      "0.1",
+      "1"
+    ),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    limits = log10(c(1e-4, 1)),
+    breaks = log10(c(1e-4, 1e-3, 1e-2, 1e-1, 1)),
+    labels = c(
+      "0.0001",
+      "0.001",
+      "0.01",
+      "0.1",
+      "1"
+    ),
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = "Resistance in 1990",
+    y = "Resistance in 2023"
+  ) +
+  coord_equal(expand = FALSE) +
+  theme_classic(base_size = 8) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(
+      face = "bold",
+      size = 8
+    ),
+    panel.spacing = unit(0.8, "lines"),
+    axis.text = element_text(size = 6),
+    axis.title = element_text(size = 8)
+  )
+
+species_trajectory_grid
+
+```
+
+#### 3.6.3 Species change summary
+
+Summarises the species-level changes, highlighting priority pathogens and the largest increases and decreases.
+
+```{r 3_6_3_species_change_summary}
+
+eskape <- c(
+  "A. baumannii",
+  "E. faecium",
+  "E. cloacae",
+  "K. pneumoniae",
+  "P. aeruginosa",
+  "S. aureus"
+)
+
+# Add ESKAPE flag
+dat <- species_predictions_plot %>%
+  mutate(
+    eskape = species %in% eskape,
+    fold_change = p_2023 / p_1990,
+    change = p_2023 - p_1990
+  )
+
+# Species-level summary
+species_summary <- dat %>%
+  group_by(species, eskape) %>%
+  summarise(
+    mean_1990 = mean(p_1990),
+    mean_2023 = mean(p_2023),
+    mean_change = mean(change),
+    .groups = "drop"
+  )
+
+# 1. ESKAPE pathogens
+eskape_summary <- species_summary %>%
+  filter(eskape) %>%
+  arrange(desc(mean_2023))
+
+cat("ESKAPE PATHOGENS\n")
+print(eskape_summary)
+
+# 2. Five biggest increasing non-ESKAPE species
+cat("TOP 5 INCREASING NON-ESKAPE\n")
+species_summary %>%
+  filter(!eskape) %>%
+  arrange(desc(mean_change)) %>%
+  slice_head(n = 5) %>%
+  print()
+
+# 3. Five highest resistance non-ESKAPE species
+cat("TOP 5 HIGHEST RESISTANCE NON-ESKAPE\n")
+species_summary %>%
+  filter(!eskape) %>%
+  arrange(desc(mean_2023)) %>%
+  slice_head(n = 5) %>%
+  print()
+
+# 4. Percentage of species-antibiotic combinations that decreased
+pct_decreased <- mean(dat$change < 0) * 100
+
+cat("DECLINING SPECIES-ANTIBIOTIC COMBINATIONS\n")
+cat(round(pct_decreased, 1), "% decreased between 1990 and 2023\n")
+
+pct_decreased <- dat %>%
+  group_by(antibiotic) %>%
+  summarise(
+    pct_decreased = round(100 * mean(change < 0), 1),
+    .groups = "drop"
+  )
+
+pct_decreased
+
+# 5. Five largest decreases
+cat("TOP 5 DECREASING SPECIES-ANTIBIOTIC COMBINATIONS\n")
+dat %>%
+  arrange(change) %>%
+  select(species, antibiotic, p_1990, p_2023, change) %>%
+  slice_head(n = 5) %>%
+  print()
+```
+
+### 3.8 Country
+
+#### 3.8.1 Trajectories
+
+Predicts country-level resistance trajectories and prepares the country-by-antibiotic comparison tiles.
+
+```{r 3_8_1_trajectories}
+country_smooth_predictions <- purrr::map_dfr(
+  fit_files,
+  \(f) {
+
+    ab <- basename(f) %>%
+      stringr::str_remove("^fit_") %>%
+      stringr::str_remove("\\.rds$")
+
+    message("Predicting country-year trends for: ", ab)
+
+    input_key <- dplyr::case_when(
+      ab == "Polymyxins" ~ "gram_negative",
+      ab == "Oxazolidinones" ~ "gram_positive",
+      TRUE ~ "combined"
+    )
+
+    input_ab <- stan_input_1[[input_key]]
+
+    year_z_pred <- (analysis_years - input_ab$year_center) /
+      input_ab$year_scale
+
+    sc_pred <- mgcv::PredictMat(
+      input_ab$sc,
+      data.frame(year_z = year_z_pred)
+    )
+
+    B_pred <- scale(
+      sc_pred,
+      center = attr(input_ab$B_year, "scaled:center"),
+      scale = attr(input_ab$B_year, "scaled:scale")
+    )
+
+    colnames(B_pred) <- colnames(input_ab$B_year)
+    rownames(B_pred) <- as.character(analysis_years)
+
+    country_obs <- unique(input_ab$dat$ISO.3)
+
+    fit <- readRDS(f)
+
+    draws <- fit$draws(
+      variables = c(
+        "alpha",
+        "beta_global",
+        "alpha_country",
+        "beta_country"
+      ),
+      format = "matrix"
+    )
+
+    draws <- draws[
+      sample(seq_len(nrow(draws)), min(1000, nrow(draws))),
+      ,
+      drop = FALSE
+    ]
+
+    alpha <- draws[, "alpha"]
+
+    beta_global <- draws[
+      ,
+      grep("^beta_global\\[", colnames(draws)),
+      drop = FALSE
+    ]
+
+    alpha_country <- draws[
+      ,
+      grep("^alpha_country\\[", colnames(draws)),
+      drop = FALSE
+    ]
+
+    modelled_rows <- purrr::map_dfr(seq_along(country_obs), \(c) {
+
+      beta_country_c <- draws[
+        ,
+        grep(
+          paste0("^beta_country\\[", c, ","),
+          colnames(draws)
+        ),
+        drop = FALSE
+      ]
+
+      eta <- sweep(
+        beta_global %*% t(B_pred),
+        1,
+        alpha + alpha_country[, c],
+        "+"
+      ) +
+        beta_country_c %*% t(B_pred)
+
+      p <- plogis(eta)
+
+      purrr::map_dfr(seq_along(analysis_years), \(j) {
+        summ_prob(p[, j]) %>%
+          dplyr::mutate(
+            antibiotic = ab,
+            ISO.3 = country_obs[c],
+            year = analysis_years[j],
+            source = "modelled",
+            .before = 1
+          )
+      })
+    }) %>%
+      dplyr::select(
+        antibiotic, ISO.3, year,
+        q025, q10, q25, q50, q75, q90, q975, source
+      )
+
+    modelled_rows
+  }
+)
+
+```
+
+#### 3.8.2 Maps and panel assembly
+
+Builds the antibiotic-specific map insets and combines them with the trajectory tiles into the final country panel.
+
+```{r 3_8_2_maps_and_panel_assembly, fig.width=7, fig.height=11}
+
+country_meta <- rnaturalearth::ne_countries(
+  scale = "medium",
+  returnclass = "sf"
+) %>%
+  sf::st_drop_geometry() %>%
+  dplyr::transmute(
+    ISO.3 = iso_a3_eh,
+    continent = dplyr::case_when(
+      iso_a3_eh == "MUS" ~ "Africa",
+      TRUE ~ continent)
+  ) %>%
+  dplyr::filter(
+    !is.na(ISO.3),
+    ISO.3 != "-99"
+  ) %>%
+  dplyr::distinct(ISO.3, .keep_all = TRUE)
+
+country_bi_df <- country_smooth_predictions %>%
+  dplyr::filter(year %in% c(1990, 2023)) %>%
+  dplyr::select(ISO.3, antibiotic, year, q50) %>%
+  tidyr::pivot_wider(
+    names_from = year,
+    values_from = q50,
+    names_prefix = "p_"
+  ) %>%
+  dplyr::left_join(country_meta, by = "ISO.3") %>%
+  dplyr::mutate(
+    continent = tidyr::replace_na(continent, "Unknown"),
+    x = log10(pmax(p_1990, p_min)),
+    y = log10(pmax(p_2023, p_min)),
+    x01 = scales::rescale(x, from = c(log10(p_min), 0), to = c(0, 1)),
+    y01 = scales::rescale(y, from = c(log10(p_min), 0), to = c(0, 1)),
+    bi_colour = bi_colour_continuous(
+      x = x01,
+      y = y01,
+      palette_bi = palette_bi
+    )
+  )
+
+country_order <- country_bi_df %>%
+  dplyr::group_by(continent, ISO.3) %>%
+  dplyr::summarise(mean_2023 = mean(p_2023, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::arrange(continent, mean_2023) %>%
+  dplyr::pull(ISO.3)
+
+continent_order <- c(
+  "Africa",
+  "Asia",
+  "Oceania",
+  "Europe",
+  "North America",
+  "South America"
+)
+
+country_trajectory_tile_plot <- country_bi_df %>%
+  dplyr::mutate(
+    antibiotic = factor(antibiotic, levels = global_order),
+    ISO.3 = factor(ISO.3, levels = country_order),
+    continent = factor(continent, levels = continent_order)
+  ) %>%
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = antibiotic,
+      y = ISO.3,
+      fill = bi_colour
+    )
+  ) +
+  ggplot2::geom_tile(
+    colour = "grey85",
+    linewidth = 0.15
+  ) +
+  ggplot2::scale_fill_identity() +
+  ggplot2::facet_grid(
+    continent ~ .,
+    scales = "free_y",
+    space = "free_y"
+  ) +
+  ggplot2::labs(
+    x = "",
+    y = ""
+  ) +
+  ggplot2::theme_classic(base_size = 8) +
+  ggplot2::theme(
+    strip.background = ggplot2::element_blank(),
+    strip.text = element_blank(),
+    axis.text.x = ggplot2::element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1,
+      size = 4
+    ),
+    axis.text = ggplot2::element_text(size = 4),
+    axis.title = ggplot2::element_text(size = 8),
+    axis.ticks = ggplot2::element_blank(),
+    panel.grid = ggplot2::element_blank()
+  )
+
+country_trajectory_tile_plot
+
+map_ab <- c("Betalactams", "Quinolones", "Polymyxins")
+
+world_sf <- rnaturalearth::ne_countries(
+  scale = "medium",
+  returnclass = "sf"
+) %>%
+  dplyr::mutate(ISO.3 = iso_a3_eh)
+
+map_df <- country_bi_df %>%
+  dplyr::filter(antibiotic %in% map_ab) %>%
+  dplyr::select(ISO.3, antibiotic, bi_colour)
+
+map_sf <- purrr::map_dfr(
+  map_ab,
+  \(ab) {
+    world_sf %>%
+      dplyr::mutate(antibiotic = ab) %>%
+      dplyr::left_join(
+        map_df %>% dplyr::filter(antibiotic == ab),
+        by = c("ISO.3", "antibiotic")
+      )
+  }
+)
+
+
+make_map_panel <- function(ab) {
+
+  map_ab_sf <- map_sf %>%
+    dplyr::filter(antibiotic == ab)
+
+  scatter_ab <- country_bi_df %>%
+    dplyr::filter(antibiotic == ab)
+
+  p_map <- ggplot2::ggplot(map_ab_sf) +
+    ggplot2::geom_sf(
+      ggplot2::aes(fill = bi_colour),
+      colour = "grey75",
+      linewidth = 0.04
+    ) +
+    ggplot2::scale_fill_identity(na.value = "white") +
+    ggplot2::coord_sf(expand = FALSE) +
+    ggplot2::labs(title = ab) +
+    ggplot2::theme_void(base_size = 8) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(
+        hjust = 0.5,
+        size = 10
+      )
+    )
+
+  p_scatter <- ggplot2::ggplot() +
+    ggplot2::geom_raster(
+      data = bi_background_log_df,
+      ggplot2::aes(x = x, y = y, fill = fill)
+    ) +
+    ggplot2::scale_fill_identity() +
+    ggplot2::geom_abline(
+      intercept = 0,
+      slope = 1,
+      linewidth = 0.25,
+      linetype = "dashed",
+      colour = "grey20"
+    ) +
+    ggplot2::geom_point(
+      data = scatter_ab,
+      ggplot2::aes(
+        x = log10(pmax(p_1990, p_min)),
+        y = log10(pmax(p_2023, p_min))
+      ),
+      shape = 21,
+      size = 0.8,
+      fill = "white",
+      colour = "black",
+      alpha = 0.75,
+      stroke = 0.15
+    ) +
+    ggplot2::scale_x_continuous(
+      limits = log10(c(p_min, 1)),
+      breaks = log10(log_breaks),
+      labels = log_labels,
+      expand = c(0, 0)
+    ) +
+    ggplot2::scale_y_continuous(
+      limits = log10(c(p_min, 1)),
+      breaks = log10(log_breaks),
+      labels = log_labels,
+      expand = c(0, 0)
+    ) +
+    ggplot2::coord_fixed() +
+    ggplot2::labs(
+      x = "1990",
+      y = "2023"
+    ) +
+    ggplot2::theme_classic(base_size = 5) +
+    ggplot2::theme(
+      axis.text = ggplot2::element_text(size = 4),
+      axis.title = ggplot2::element_text(size = 5),
+      axis.ticks.length = grid::unit(0.7, "mm"),
+      plot.margin = ggplot2::margin(1, 1, 1, 1)
+    )
+
+  cowplot::ggdraw(p_map) +
+    cowplot::draw_plot(
+      p_scatter,
+      x = -0.02,
+      y = 0.02,
+      width = 0.3,
+      height = 0.4
+    )
+}
+
+country_map_inset_grid <- cowplot::plot_grid(
+  make_map_panel("Betalactams"),
+  make_map_panel("Quinolones"),
+  make_map_panel("Polymyxins"),
+  ncol = 1,
+  align = "v"
+)
+
+country_structure_panel <- cowplot::plot_grid(
+  country_trajectory_tile_plot,
+  country_map_inset_grid,
+  nrow = 1,
+  rel_widths = c(0.2, 0.8),
+  align = "h",
+  axis = "tb"
+)
+
+ggsave(
+  filename = "outputs/country_structure_panel.pdf",
+  plot = country_structure_panel,
+  width = 18.3,
+  height = 24.7,
+  units = "cm",
+  dpi = 600,
+  device = cairo_pdf,
+  bg = "white"
+)
+```
+
+## 4 Model multidrug covariance
+
+### 4.1 Structure
+
+#### 4.1.1 Modelling covariance among resistance phenotypes
+
+The Resistance Trajectory Model estimates the marginal probability of resistance to each antimicrobial class independently. This does not capture whether resistance phenotypes occur independently within isolates or preferentially accumulate together. For example, if resistance to two antimicrobial classes each has probability 0.2, independence implies that only \(0.2\times0.2=0.04\) of isolates should be resistant to both. Positive covariance would increase the frequency of isolates carrying both resistance phenotypes. We therefore fitted a multivariate probit model to estimate covariance among resistance phenotypes while preserving the marginal resistance probabilities estimated by the Resistance Trajectory Model.
+For isolate \(i\), the observed binary resistance profile across \(D\) antimicrobial classes,
+\[
+\mathbf y_i=(y_{i1},\ldots,y_{iD}),
+\]is assumed to arise from an underlying vector of continuous latent resistance scores,
+\[
+\mathbf z_i \sim
+\mathcal N_D(\boldsymbol\mu_i,\mathbf R_{s[i]}),
+\]with
+\[
+y_{ij}=\mathbb I(z_{ij}>0).
+\]The latent means are fixed from the Resistance Trajectory Model by transforming the estimated marginal resistance probabilities onto the probit scale,
+\[
+\mu_{ij}=\Phi^{-1}(p_{ij}).
+\]The covariance model therefore does not re-estimate resistance prevalence. Instead, it estimates the latent correlation matrix \(\mathbf R_s\), describing whether resistance phenotypes occur together more or less frequently than expected from their marginal probabilities.
+We estimate a shared global resistance-correlation architecture and allow each species to depart from it:
+\[
+\mathbf u_s=\mathbf u_{\text{global}}+\boldsymbol\delta_s.
+\]There is a separate deviation for every species × resistance relationship, allowing different correlations within the same species to move in different directions. These species deviations contain both independent and phylogenetically structured components,
+\[
+\boldsymbol\delta_p \propto
+\sqrt{1-\lambda_{\text{phylo}}}\,
+\boldsymbol\delta^{\text{ind}}_p
++
+\sqrt{\lambda_{\text{phylo}}}\,
+\boldsymbol\delta^{\text{phylo}}_p,
+\]so related bacterial species can share similar covariance structures while retaining species-specific departures. Shrinkage regularises weakly supported species differences towards the shared global architecture.
+The unconstrained parameters \(\mathbf u_s\) are transformed into partial correlations and used to construct a valid Cholesky factor,
+\[
+\mathbf R_s=\mathbf L_s\mathbf L_s^\top.
+\]
+
+#### 4.1.2 GHK
+
+Calculating the probability of a complete binary resistance profile under a high-dimensional multivariate normal is computationally difficult. We therefore approximate the multivariate probit likelihood using the Geweke–Hajivassiliou–Keane (GHK) simulator. GHK sequentially samples latent values from the regions consistent with each observed resistance phenotype and uses these draws to approximate
+\[
+P(\mathbf y_i\mid\boldsymbol\mu_i,\mathbf R_s).
+\]We use 30 fixed GHK draws per isolate. Stan then estimates the correlation parameters according to how well the resulting correlation matrices explain the observed combinations of resistance. This approach was inspired by: 
+
+https://discourse.mc-stan.org/t/gaussian-copula-for-discrete-marginals/691/30?utm_source=chatgpt.com
+
+https://journals.sagepub.com/doi/epdf/10.1177/1536867X0300300305
+
+
+```{r 4_1_structure}
+
+stan_code_2 <- "
+functions {
+
+  matrix cholesky_from_partial(vector u, int D) {
+
+    int P = num_elements(u);
+    vector[P] r = tanh(u);
+
+    matrix[D,D] L;
+
+    int pos = 1;
+    real prod_val;
+
+    for (i in 1:D)
+      for (j in 1:D)
+        L[i,j] = 0;
+
+    L[1,1] = 1;
+
+    for (i in 2:D) {
+
+      prod_val = 1;
+
+      for (j in 1:(i-1)) {
+
+        L[i,j] = r[pos] * sqrt(prod_val);
+
+        prod_val *= (1 - square(r[pos]));
+
+        pos += 1;
+      }
+
+      L[i,i] = sqrt(prod_val);
+    }
+
+    return L;
+  }
+
+  real mvprobit_ghk_lpmf(
+      array[] int y,
+      vector mu,
+      matrix L,
+      matrix U
+  ) {
+
+    int D = rows(L);
+    int M = rows(U);
+
+    vector[M] lp_draw;
+
+    for (m in 1:M) {
+
+      vector[D] x;
+      real lp = 0;
+
+      for (j in 1:D) {
+
+        real cond_mu = mu[j];
+        real lb;
+        real ub;
+        real p_lb;
+        real p_ub;
+        real p_int;
+        real q;
+
+        if (j > 1) {
+
+          for (h in 1:(j-1))
+            cond_mu += L[j,h] * x[h];
+
+        }
+
+        if (y[j] == 1) {
+
+          lb = -cond_mu / L[j,j];
+          ub = positive_infinity();
+
+        } else {
+
+          lb = negative_infinity();
+          ub = -cond_mu / L[j,j];
+
+        }
+
+        p_lb = Phi(lb);
+        p_ub = Phi(ub);
+
+        p_int = fmax(p_ub - p_lb, 1e-12);
+
+        q = p_lb + U[m,j] * p_int;
+        q = fmin(fmax(q,1e-12),1-1e-12);
+
+        x[j] = inv_Phi(q);
+
+        lp += log(p_int);
+      }
+
+      lp_draw[m] = lp;
+    }
+
+    return log_sum_exp(lp_draw) - log(M);
+  }
+
+}
+
+data {
+
+  int<lower=1> N;
+  int<lower=2> D;
+  int<lower=1> S;
+  int<lower=1> M_ghk;
+
+  array[N,D] int<lower=0,upper=1> y;
+
+  matrix[N,D] eta;
+
+  array[N] int<lower=1,upper=S> species_id;
+
+  matrix[S,S] L_phylo;
+
+  matrix[M_ghk,D] U_ghk;
+
+}
+
+transformed data {
+
+  int P = (D * (D - 1)) %/% 2;
+
+}
+
+parameters {
+
+  // Global covariance
+  vector[P] u_global;
+
+  // Species-specific deviations
+  matrix[S,P] delta_ind_raw;
+  matrix[S,P] delta_phylo_raw;
+
+  // Global-local shrinkage
+  real<lower=0> tau_global;
+  vector<lower=0>[P] tau_local;
+
+  // Relative independent / phylogenetic contribution
+  real<lower=0> sigma_delta;
+  real<lower=0,upper=1> lambda_phylo;
+
+}
+
+transformed parameters {
+
+  matrix[S,P] delta;
+
+  array[S] matrix[D,D] L_species;
+
+  for (p in 1:P) {
+
+    vector[S] phy;
+
+    phy = L_phylo * delta_phylo_raw[,p];
+
+    delta[,p] =
+      tau_global *
+      tau_local[p] *
+      sigma_delta *
+      (
+      sqrt(1 - lambda_phylo) *
+      (delta_ind_raw[,p] - mean(delta_ind_raw[,p]))
+      +
+      sqrt(lambda_phylo) *
+      (phy - mean(phy))
+      );
+  }
+
+  for (s in 1:S) {
+
+    vector[P] u_s;
+
+    u_s = u_global + delta[s]';
+
+    L_species[s] =
+      cholesky_from_partial(u_s,D);
+
+  }
+
+}
+
+model {
+
+  // ----------------------------------------------------
+  // Global covariance
+  // ----------------------------------------------------
+
+  u_global ~ normal(0, 1);
+
+  // ----------------------------------------------------
+  // Species deviations
+  // ----------------------------------------------------
+
+  to_vector(delta_ind_raw) ~ normal(0, 1);
+
+  to_vector(delta_phylo_raw) ~ normal(0, 1);
+
+  // ----------------------------------------------------
+  // Hierarchical global-local shrinkage
+  // ----------------------------------------------------
+
+  tau_global ~ student_t(3, 0, 0.5);
+
+  tau_local ~ lognormal(-0.5, 0.75);
+
+  // ----------------------------------------------------
+  // Relative magnitude of independent vs phylogenetic
+  // variation
+  // ----------------------------------------------------
+
+  sigma_delta ~ student_t(3,0,1);
+  lambda_phylo ~ beta(1,1);
+
+  // ----------------------------------------------------
+  // Multivariate probit likelihood (GHK)
+  // ----------------------------------------------------
+
+  for (n in 1:N) {
+
+    target += mvprobit_ghk_lpmf(
+      y[n] |
+      to_vector(eta[n]'),
+      L_species[species_id[n]],
+      U_ghk
+    );
+
+  }
+
+}
+
+generated quantities {
+
+  vector[P] sd_species;
+
+  for (p in 1:P)
+    sd_species[p] = tau_global * tau_local[p];
+
+}
+"
+
+writeLines(stan_code_2, "mv_probit.stan")
+
+```
+
+### 4.2 Prepare data
+
+Constructs the offset data and binary response matrices used for the multidrug covariance model.
+
+```{r 4_2_prepare_data}
+eps_p <- 1e-5
+
+offset_long_df <- species_smooth_predictions %>%
+  dplyr::select(species, antibiotic, year, p_species = q50) %>%
+  dplyr::left_join(
+    country_smooth_predictions %>%
+      dplyr::select(ISO.3, antibiotic, year, p_country = q50),
+    by = c("antibiotic", "year")
+  ) %>%
+  dplyr::mutate(
+    p_species = as.numeric(p_species),
+    p_country = as.numeric(p_country),
+    p_offset = sqrt(p_species * p_country),
+    p_offset = pmin(pmax(p_offset, eps_p), 1 - eps_p),
+    eta_offset = as.numeric(qnorm(p_offset))
+  ) %>%
+  dplyr::select(antibiotic, ISO.3, species, year, p_offset, eta_offset)
+
+isolates_sub <- isolates_clean %>%
+  dplyr::group_by(species) %>%
+  dplyr::mutate(rand = runif(dplyr::n())) %>%
+  dplyr::arrange(rand, .by_group = TRUE) %>%
+  dplyr::slice_head(n = 250) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-rand)
+
+isolates_offset_long <- isolates_sub %>%
+  dplyr::select(
+    id,
+    species,
+    ISO.3,
+    year,
+    gram,
+    dplyr::all_of(ab_list)
+  ) %>%
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(ab_list),
+    names_to = "antibiotic",
+    values_to = "resistant"
+  ) %>%
+  mutate(
+    species = short_species_label(species)
+  ) %>%
+  dplyr::left_join(
+    offset_long_df,
+    by = c("species", "ISO.3", "year", "antibiotic")
+  )
+rm(offset_long_df)
+
+# -----------------------------
+# Use existing phylogeny from stan_input
+# -----------------------------
+phylo_cor <- stan_input_1$combined$phylo_cor
+rownames(phylo_cor) <- short_species_label(rownames(phylo_cor))
+colnames(phylo_cor) <- short_species_label(colnames(phylo_cor))
+
+# -----------------------------
+# Stan offset data from long offsets
+# -----------------------------
+
+stan_offset_df <- isolates_offset_long %>%
+  dplyr::filter(
+    !is.na(resistant),
+    !is.na(eta_offset),
+    resistant %in% c(0, 1)
+  ) %>%
+  dplyr::group_by(id, species, ISO.3, year, gram, antibiotic) %>%
+  dplyr::summarise(
+    resistant = dplyr::first(as.integer(resistant)),
+    eta_offset = mean(as.numeric(eta_offset), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = antibiotic,
+    values_from = c(resistant, eta_offset),
+    names_glue = "{.value}_{antibiotic}"
+  ) %>%
+  dplyr::filter(
+    dplyr::if_all(
+      dplyr::starts_with("resistant_"),
+      ~ !is.na(.x)
+    ),
+    dplyr::if_all(
+      dplyr::starts_with("eta_offset_"),
+      ~ !is.na(.x)
+    )
+  ) %>%
+  dplyr::mutate(
+    species_id = as.integer(factor(species, levels = rownames(phylo_cor)))
+  )
+
+
+Y <- stan_offset_df %>%
+  dplyr::select(dplyr::all_of(paste0("resistant_", ab_list))) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), as.integer)) %>%
+  as.matrix()
+
+ETA <- stan_offset_df %>%
+  dplyr::select(dplyr::all_of(paste0("eta_offset_", ab_list))) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), as.numeric)) %>%
+  as.matrix()
+
+
+# -----------------------------
+# Stan data
+# -----------------------------
+
+
+
+
+M_ghk <- 50 #Informed by https://journals.sagepub.com/doi/epdf/10.1177/1536867X0300300305
+
+stan_input_2 <- list(
+  N = nrow(Y),
+  D = length(ab_list),
+  S = nrow(phylo_cor),
+  M_ghk = M_ghk,
+  y = Y,
+  eta = ETA,
+  species_id = stan_offset_df$species_id,
+  L_phylo = t(chol(phylo_cor + diag(1e-6, nrow(phylo_cor)))),
+  U_ghk = matrix(
+    runif(M_ghk * length(ab_list), 1e-6, 1 - 1e-6),
+    nrow = M_ghk,
+    ncol = length(ab_list)
+  )
+)
+
+```
+
+### 4.3 Compile and run
+
+Writes the covariance model to disk, sets the initial values, and loads the fitted covariance object.
+
+```{r 4_3_compile_and_run}
+
+#mod <- cmdstanr::cmdstan_model(
+#  "mv_probit.stan",
+#  force_recompile = TRUE,
+#  quiet = FALSE
+#)
+
+init_fun_2 <- function() {
+  P <- stan_base$D * (stan_base$D - 1) / 2
+  list(
+    u_global = rep(0, P),
+    delta_ind_raw = matrix(0, stan_base$S, P),
+    delta_phylo_raw = matrix(0, stan_base$S, P),
+    tau_global = 0.1,
+    tau_local = rep(1, P),
+    sigma_delta = 0.2,
+    lambda_phylo = 0.5
+  )
+}
+
+#fit_cov <- mod$variational(
+#  data = stan_input_2,
+#  algorithm = "meanfield",
+#  iter = 20000,
+#  eval_elbo = 250,
+#  tol_rel_obj = 0.005,
+#  output_samples = 1000,
+#  eta = 0.1,
+#  seed = 123,
+#  init = init_fun_2,
+#  refresh = 10
+#)
+
+#fit_cov$save_object("fit_mv_probit.rds")
+fit_cov <- readRDS("fit_mv_probit.rds")
+
+```
+
+### 4.4 Covariance diagnostics and effect summaries
+
+Extracts the fitted covariance matrix, summarises the shrinkage parameters, and visualises the main covariance diagnostics.
+
+```{r 4_4_covariance_diagnostics_and_effect_summaries, fig.width=7, fig.height=7}
+
+draws <- fit_cov$draws(format = "draws_df") %>%
+  as.data.frame() %>%
+  mutate(draw_id = row_number())
+
+P <- length(ab_list)* (length(ab_list) - 1) / 2
+
+# -----------------------------
+# 1. Global covariance matrix
+# -----------------------------
+
+u_cols <- grep("^u_global\\[", names(draws), value = TRUE)
+u_idx <- as.integer(str_match(u_cols, "\\[(\\d+)\\]")[, 2])
+u_cols <- u_cols[order(u_idx)]
+
+u_global_med <- apply(
+  as.matrix(draws[, u_cols, drop = FALSE]),
+  2,
+  median
+)
+
+R_global <- make_R(u_global_med)
+
+covariance_palette <- colorRampPalette(c(
+  "#009E73",
+  "#FFFFFF",
+  "#7570B3"
+))(200)
+
+global_covariance_matrix_plot <- ggplotify::as.ggplot(~ corrplot::corrplot(
+  R_global,
+  is.corr = TRUE,
+  method = "color",
+  type = "full",
+  col = covariance_palette,
+  tl.pos = "n",        # <- no row/column labels
+  tl.col = "black",
+  tl.cex = 0.75
+))
+
+ggsave(
+  filename = "outputs/global_covariance_matrix.pdf",
+  plot = global_covariance_matrix_plot,
+  width = 18,
+  height = 18,
+  units = "cm",
+  dpi = 600,
+  device = cairo_pdf,
+  bg = "white"
+)
+
+
+# -----------------------------
+# Species-level covariance variation
+# -----------------------------
+
+species_var_summary <- draws %>%
+  summarise(
+    sigma_delta_q025 = quantile(sigma_delta, 0.025),
+    sigma_delta_q50  = median(sigma_delta),
+    sigma_delta_q975 = quantile(sigma_delta, 0.975),
+    lambda_phylo_q025 = quantile(lambda_phylo, 0.025),
+    lambda_phylo_q50  = median(lambda_phylo),
+    lambda_phylo_q975 = quantile(lambda_phylo, 0.975)
+  )
+
+print(species_var_summary)
+
+# -----------------------------
+# Plot: how much species-level covariance variation?
+# -----------------------------
+
+species_covariance_variation_histogram <- ggplot(draws, aes(sigma_delta)) +
+  geom_histogram(bins = 40) +
+  theme_classic(base_size = 9) +
+  labs(
+    x = "Species-level covariance variation, sigma_delta",
+    y = "Posterior draws",
+    title = "Magnitude of between-species covariance variation"
+  )
+
+species_covariance_variation_histogram
+
+# -----------------------------
+# Plot: what proportion is phylogenetic?
+# -----------------------------
+
+phylogenetic_covariance_share_histogram <- ggplot(draws, aes(lambda_phylo)) +
+  geom_histogram(bins = 40) +
+  theme_classic(base_size = 9) +
+  labs(
+    x = "Proportion of species covariance variation attributed to phylogeny",
+    y = "Posterior draws",
+    title = "Phylogenetic share of covariance variation"
+  )
+
+phylogenetic_covariance_share_histogram
+
+```
+
+### 4.5 Species covariance deviation analysis
+
+Decomposes species-specific covariance deviations with PCA, checks for phylogenetic signal, and visualises the most extreme species patterns.
+
+```{r 4_5_species_covariance_deviation_analysis, fig.width=7, fig.height=7}
+
+species_levels <- rownames(phylo_cor)
+
+u_cols <- grep("^u_global\\[", names(draws), value = TRUE)
+u_idx <- as.integer(stringr::str_match(u_cols, "\\[(\\d+)\\]")[, 2])
+u_cols <- u_cols[order(u_idx)]
+
+u_global_med <- apply(
+  as.matrix(draws[, u_cols, drop = FALSE]),
+  2,
+  median
+)
+
+delta_cols <- grep("^delta\\[", names(draws), value = TRUE)
+
+delta_long <- draws %>%
+  dplyr::select(draw_id, dplyr::all_of(delta_cols)) %>%
+  tidyr::pivot_longer(
+    cols = -draw_id,
+    names_to = "parameter",
+    values_to = "delta"
+  ) %>%
+  dplyr::mutate(
+    s = as.integer(stringr::str_match(parameter, "\\[(\\d+),(\\d+)\\]")[, 2]),
+    p = as.integer(stringr::str_match(parameter, "\\[(\\d+),(\\d+)\\]")[, 3]),
+    species = species_levels[s]
+  )
+
+delta_med <- delta_long %>%
+  dplyr::group_by(species, s, p) %>%
+  dplyr::summarise(
+    delta = median(delta),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = p,
+    values_from = delta,
+    names_prefix = "p"
+  ) %>%
+  dplyr::arrange(s)
+
+# -----------------------------
+# Build species x 78 model-derived correlation-feature data frame
+# -----------------------------
+
+R_species <- vector("list", nrow(delta_med))
+names(R_species) <- delta_med$species
+
+R_feature_df <- purrr::map_dfr(seq_len(nrow(delta_med)), function(i) {
+  
+  sp <- delta_med$species[i]
+  
+  delta_vec <- delta_med %>%
+    dplyr::slice(i) %>%
+    dplyr::select(starts_with("p")) %>%
+    as.numeric()
+  
+  u_s <- u_global_med + delta_vec
+  R_s <- make_R(u_s)
+  
+  R_species[[sp]] <<- R_s
+  
+  tibble(
+    species = sp,
+    pair = combn(ab_list, 2, paste, collapse = "__"),
+    value = R_s[upper.tri(R_s)]
+  ) %>%
+    tidyr::pivot_wider(
+      names_from = pair,
+      values_from = value
+    )
+})
+
+# species x 78 numeric matrix
+X <- R_feature_df %>%
+  dplyr::select(-species) %>%
+  as.matrix()
+
+rownames(X) <- R_feature_df$species
+
+# -----------------------------
+# Subtract global correlation architecture
+# -----------------------------
+
+r_global <- R_global[upper.tri(R_global)]
+
+X_dev <- sweep(X, 2, r_global, FUN = "-")
+
+# -----------------------------
+# 1. PCA of species covariance deviations
+# -----------------------------
+
+pca <- prcomp(
+  X_dev,
+  center = FALSE,
+  scale. = FALSE
+)
+
+pca_var <- tibble(
+  axis = seq_along(pca$sdev),
+  PC = paste0("PC", axis),
+  variance = pca$sdev^2,
+  prop_variance = variance / sum(variance),
+  cum_variance = cumsum(prop_variance)
+)
+
+print(pca_var)
+
+species_pc_scores <- as.data.frame(pca$x[, 1, drop = FALSE]) %>%
+  tibble::rownames_to_column("species") %>%
+  dplyr::rename(score_PC1 = PC1)
+
+pc1_var <- pca_var$prop_variance[1] * 100
+pc1_var 
+
+gram_list <- all_species_gram
+gram_list$species <- short_species_label(gram_list$species)
+plot_meta <- species_pc_scores %>%
+  dplyr::left_join(gram_list, by = "species") %>%
+  dplyr::mutate(
+    gram = factor(gram, levels = c("Gram-negative", "Gram-positive"))
+  ) 
+
+pc1_vec <- plot_meta$score_PC1
+names(pc1_vec) <- plot_meta$species
+
+lambda_fit <- phytools::phylosig(
+  tree_plot,
+  x = pc1_vec,
+  method = "lambda",
+  test = TRUE
+)
+
+lambda_fit
+
+species_covariance_pc1_plot <- ggplot(
+  plot_meta,
+  aes(x = gram, y = score_PC1, fill = gram)
+) +
+  geom_boxplot(
+    width = 0.55,
+    outlier.shape = NA,
+    alpha = 0.75
+  ) +
+  geom_jitter(
+    aes(colour = gram),
+    width = 0.12,
+    size = 1.6,
+    alpha = 0.75
+  ) +
+  scale_fill_manual(
+    values = c("grey20", "white")
+  ) +
+  scale_colour_manual(
+    values =  c("grey20", "grey80")
+  ) +
+  theme_classic(base_size = 9) +
+  theme(
+    legend.position = "none"
+  ) +
+  labs(
+    x = "",
+    y = "PCA score"
+  )
+
+species_covariance_pc1_plot
+
+ggsave(
+  filename = "outputs/species_covariance_pc1_plot.pdf",
+  plot = species_covariance_pc1_plot,
+  width = 6,
+  height = 7,
+  units = "cm",
+  dpi = 600,
+  device = cairo_pdf,
+  bg = "white"
+)
+  
+# -----------------------------
+# Simple statistical test
+# -----------------------------
+
+student_t <- t.test(
+  score_PC1 ~ gram,
+  data = plot_meta,
+  var.equal = TRUE
+)
+
+student_t
+
+# -----------------------------
+# Identify lowest and highest PC1 species
+# -----------------------------
+
+pc1_extremes <- plot_meta %>%
+  dplyr::filter(!is.na(score_PC1)) %>%
+  dplyr::slice(c(
+    which.min(score_PC1),
+    which.max(score_PC1)
+  )) %>%
+  dplyr::mutate(
+    extreme = c("Lowest PC1", "Highest PC1")
+  )
+
+print(pc1_extremes)
+
+lowest_pc1_species_covariance_plot <- R_species[[pc1_extremes$species[1]]] - R_global
+lowest_pc1_species_covariance_plot <- ggplotify::as.ggplot(~ corrplot::corrplot(
+    lowest_pc1_species_covariance_plot,
+    is.corr = FALSE,
+    method = "color",
+    type = "full",
+    col = covariance_palette,
+    tl.pos = "n",  
+    col.lim = c(-1, 1),
+    tl.col = "black",
+    tl.cex = 0.75))
+
+ggsave(
+  filename = "outputs/lowest_pc1_species_covariance.pdf",
+  plot = lowest_pc1_species_covariance_plot,
+  width = 18,
+  height = 18,
+  units = "cm",
+  dpi = 600,
+  device = cairo_pdf,
+  bg = "white"
+)
+
+highest_pc1_species_covariance_plot <- R_species[[pc1_extremes$species[2]]] - R_global
+highest_pc1_species_covariance_plot <- ggplotify::as.ggplot(~ corrplot::corrplot(
+    highest_pc1_species_covariance_plot,
+    is.corr = FALSE,
+    method = "color",
+    type = "full",
+    col = covariance_palette,
+    tl.pos = "n",  
+    col.lim = c(-1, 1),
+    tl.col = "black",
+    tl.cex = 0.75))
+
+ggsave(
+  filename = "outputs/highest_pc1_species_covariance.pdf",
+  plot = highest_pc1_species_covariance_plot,
+  width = 18,
+  height = 18,
+  units = "cm",
+  dpi = 600,
+  device = cairo_pdf,
+  bg = "white"
+)
+
+
+pc_tile_df <- plot_meta %>%
+  dplyr::select(species, PC1 = score_PC1) %>%
+  tibble::column_to_rownames("species")
+
+gram_tile_df <- plot_meta %>%
+  dplyr::select(species, Gram = gram) %>%
+  tibble::column_to_rownames("species")
+
+pc_lim <- max(abs(pc_tile_df$PC1), na.rm = TRUE)
+
+# ------------------------------------------------------------
+# Colours
+# ------------------------------------------------------------
+
+pc1_gradient_colors <- c(
+  low  = "grey20",
+  mid  = "grey70",
+  high = "white"
+)
+
+gram_cols <- c(
+  "Gram-negative" = "grey20",
+  "Gram-positive" = "white"
+)
+
+# ------------------------------------------------------------
+# Circular tree + PC1 + Gram status heatmaps
+# ------------------------------------------------------------
+
+p_phylo_pc1 <- ggtree::ggtree(
+  tree_plot,
+  size = 0.3,
+  colour = "grey10"
+) +
+  ggtree::geom_tiplab(
+    aes(label = ""),
+    size = 1.25,
+    align = TRUE,
+    linetype = "dotted",
+    linesize = 0.15,
+    colour = "grey10",
+    offset = 0
+  )
+
+p_phylo_pc1 <- ggtree::gheatmap(
+  p_phylo_pc1,
+  pc_tile_df,
+  offset = 0,
+  width = 0.15,
+  colnames = FALSE,
+  color = "grey90"
+) +
+  ggplot2::scale_fill_gradient2(
+    low = pc1_gradient_colors["low"],
+    mid = pc1_gradient_colors["mid"],
+    high = pc1_gradient_colors["high"],
+    midpoint = 0,
+    limits = c(-pc_lim, pc_lim)
+  )
+
+p_phylo_pc1 <- p_phylo_pc1 +
+  ggnewscale::new_scale_fill()
+
+p_phylo_pc1 <- ggtree::gheatmap(
+  p_phylo_pc1,
+  gram_tile_df,
+  offset = 0.25,
+  width = 0.15,
+  colnames = FALSE,
+  color = "grey90"
+) +
+  scale_fill_manual(
+    values = gram_cols,
+    guide = "none"
+  ) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.box = "horizontal"
+  )
+
+
+ggsave(
+  filename = "outputs/phylogeny_pc1_and_gram_annotations.pdf",
+  plot = p_phylo_pc1,
+  width = 6,
+  height = 13,
+  units = "cm",
+  dpi = 600,
+  device = cairo_pdf,
+  bg = "white"
+)
+
+```
+
+### 4.6 Covariance enrichment simulation
+
+Simulates multidrug resistance counts under independent and correlated covariance structures and plots the enrichment effect.
+
+```{r 4_6_covariance_enrichment_simulation, fig.width=7, fig.height=7}
+
+D <- length(ab_list)
+n_sim <- 1000000
+
+resistance_2023 <- global_smooth_predictions %>%
+  filter(year == 2023) %>%
+  select(
+    antibiotic,
+    mean_resistance = q50
+  ) %>%
+  mutate(
+    antibiotic = factor(
+      antibiotic,
+      levels = ab_list
+    )
+  ) %>%
+  arrange(antibiotic)
+
+resistance_2023
+P_2023 <- resistance_2023$mean_resistance
+
+P_2023 <- matrix(
+  P_2023,
+  nrow = n_sim,
+  ncol = length(P_2023),
+  byrow = TRUE
+)
+dim(P_2023)
+
+# Two covariance structures only
+R_independent <- diag(D)
+R_correlated  <- R_global[ab_list, ab_list]
+
+
+
+mdr_sim <- dplyr::bind_rows(
+  simulate_counts_from_R(
+    P = P_2023,
+    R = R_independent,
+    scenario = "Independent",
+    n_sim = n_sim
+  ),
+  simulate_counts_from_R(
+    P = P_2023,
+    R = R_correlated,
+    scenario = "Global covariance",
+    n_sim = n_sim
+  )
+)
+
+
+
+mdr_dist <- mdr_sim %>%
+  count(scenario, resistant_count, name = "n") %>%
+  complete(
+    scenario,
+    resistant_count = 0:D,
+    fill = list(n = 0)
+  ) %>%
+  group_by(scenario) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(
+    scenario = factor(
+      scenario,
+      levels = c("Independent", "Global covariance")
+    )
+  )
+
+# ------------------------------------------------------------
+# Fold enrichment: Global covariance / Independent
+# ------------------------------------------------------------
+
+ratio_df <- mdr_dist %>%
+  select(scenario, resistant_count, prop) %>%
+  pivot_wider(
+    names_from = scenario,
+    values_from = prop
+  ) %>%
+  mutate(
+    fold_change = `Global covariance` / Independent,
+    fold_change = ifelse(is.finite(fold_change), fold_change, NA)
+  )
+
+
+# ------------------------------------------------------------
+# Shared scales/theme
+# ------------------------------------------------------------
+
+x_scale <- scale_x_continuous(
+  breaks = 0:D,
+  limits = c(-0.5, D + 0.5),
+  expand = c(0, 0)
+)
+
+base_theme <- theme_classic(base_size = 9) +
+  theme(
+    panel.grid = element_blank()
+  )
+
+# ------------------------------------------------------------
+# Panel 1: overlaid distributions
+# ------------------------------------------------------------
+
+covariance_enrichment_distribution_plot <- ggplot(
+  mdr_dist,
+  aes(
+    x = factor(resistant_count),
+    y = prop,
+    fill = scenario
+  )
+) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.7,
+    colour = "black",
+    linewidth = 0.2
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Independent" = "grey90",
+      "Global covariance" = "grey50"
+    ),
+    name = NULL
+  ) +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(
+    x = "Number of resistant antibiotic classes",
+    y = "Proportion of isolates"
+  ) +
+  theme_classic(base_size = 9) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "top"
+  )
+
+# ------------------------------------------------------------
+# Panel 2: fold enrichment, log10 y-axis
+# ------------------------------------------------------------
+
+covariance_enrichment_ratio_plot <- ggplot(
+  ratio_df,
+  aes(
+    x = resistant_count,
+    y = fold_change
+  )
+) +
+  geom_hline(
+    yintercept = 1,
+    linetype = 2,
+    colour = "grey60",
+    linewidth = 0.3
+  ) +
+  geom_col(
+    fill = "grey10",
+    width = 0.85
+  ) +
+  x_scale +
+  scale_y_log10() +
+  labs(
+    x = "Number of resistant antibiotic classes",
+    y = "Fold enrichment\n(global / independent)"
+  ) +
+  base_theme
+
+# ------------------------------------------------------------
+# Combined figure: two horizontal panels
+# ------------------------------------------------------------
+
+p_covariance_effect <- covariance_enrichment_distribution_plot / covariance_enrichment_ratio_plot
+
+p_covariance_effect
+
+ggsave(
+  filename = "outputs/covariance_enrichment_summary_panel.pdf",
+  plot = p_covariance_effect,
+  width = 10, #22
+  height =14, #7
+  units = "cm",
+  dpi = 600,
+  device = cairo_pdf,
+  bg = "white"
+)
+
+
+
+```
+
+## 5 Multidrug resistance
+
+### 5.1 MDR distribution
+
+Simulates the global and priority-pathogen MDR distributions and plots the class-count profiles over time.
+
+```{r 5_1_mdr_distribution, fig.width=7, fig.height=7}
+# ============================================================
+# MDR distributions: Global, ESKAPE and WHO priority pathogens
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. Global MDR draws
+# ------------------------------------------------------------
+
+global_mdr_draws <- global_smooth_draws %>%
+  tidyr::pivot_wider(
+    id_cols = c(draw_id, year),
+    names_from = antibiotic,
+    values_from = p
+  ) %>%
+  dplyr::arrange(year, draw_id) %>%
+  dplyr::group_by(year) %>%
+  dplyr::group_modify(
+    \(dat, key) {
+      R <- as.matrix(R_global)[
+        ab_list,
+        ab_list,
+        drop = FALSE
+      ]
+
+      R <- stats::cov2cor(R)
+      R <- (R + t(R)) / 2
+      diag(R) <- 1
+
+      if (min(eigen(R, symmetric = TRUE)$values) < 0) {
+        R <- as.matrix(
+          Matrix::nearPD(
+            R,
+            corr = TRUE,
+            keepDiag = TRUE
+          )$mat
+        )
+      }
+
+      dat <- dplyr::arrange(dat, draw_id)
+
+      simulate_counts_from_R(
+        P = dat %>%
+          dplyr::select(dplyr::all_of(ab_list)) %>%
+          as.matrix(),
+        R = R,
+        draw_id = dat$draw_id
+      )
+    }
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    collection = "Global"
+  )
+
+# ------------------------------------------------------------
+# 2. Species-level MDR draws
+# ------------------------------------------------------------
+
+species_mdr_draws <- species_smooth_draws %>%
+  dplyr::mutate(
+    species = short_species_label(species)
+  ) %>%
+  tidyr::pivot_wider(
+    id_cols = c(species, gram, year, draw_id),
+    names_from = antibiotic,
+    values_from = p
+  ) %>%
+  dplyr::group_by(species, year) %>%
+  dplyr::group_modify(
+    \(dat, key) {
+      sp <- key$species[[1]]
+
+      R <- as.matrix(R_species[[sp]])[
+        ab_list,
+        ab_list,
+        drop = FALSE
+      ]
+
+      R <- stats::cov2cor(R)
+      R <- (R + t(R)) / 2
+      diag(R) <- 1
+
+      if (min(eigen(R, symmetric = TRUE)$values) < 0) {
+        R <- as.matrix(
+          Matrix::nearPD(
+            R,
+            corr = TRUE,
+            keepDiag = TRUE
+          )$mat
+        )
+      }
+
+      dat <- dplyr::arrange(dat, draw_id)
+
+      simulate_counts_from_R(
+        P = dat %>%
+          dplyr::select(dplyr::all_of(ab_list)) %>%
+          as.matrix(),
+        R = R,
+        draw_id = dat$draw_id
+      )
+    }
+  ) %>%
+  dplyr::ungroup()
+
+
+priority_pathogens <- read.csv(
+  "data/species_category.csv",
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::transmute(
+    species = short_species_label(species),
+    is_eskape = eskape == 2,
+    is_who = who == 2
+  ) %>%
+  dplyr::distinct()
+
+pathogen_collections <- priority_pathogens %>%
+  tidyr::pivot_longer(
+    cols = c(is_eskape, is_who),
+    names_to = "collection",
+    values_to = "included"
+  ) %>%
+  dplyr::filter(included) %>%
+  dplyr::transmute(
+    species,
+    collection = dplyr::recode(
+      collection,
+      is_eskape = "ESKAPE pathogens",
+      is_who = "WHO Bacterial Priority Pathogens List"
+    )
+  )
+
+priority_mdr_draws <- species_mdr_draws %>%
+  dplyr::inner_join(
+    pathogen_collections,
+    by = "species"
+  )
+
+# ------------------------------------------------------------
+# Prepare global and priority-pathogen distributions separately
+# ------------------------------------------------------------
+
+global_mdr_dist <- global_mdr_draws %>%
+  dplyr::count(
+    collection,
+    year,
+    resistant_count,
+    name = "n"
+  ) %>%
+  tidyr::complete(
+    collection,
+    year,
+    resistant_count = 0:length(ab_list),
+    fill = list(n = 0)
+  ) %>%
+  dplyr::group_by(
+    collection,
+    year
+  ) %>%
+  dplyr::mutate(
+    freq = n / sum(n)
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    resistant_count = factor(
+      resistant_count,
+      levels = 0:length(ab_list)
+    ),
+    year = as.integer(year)
+  )
+
+priority_mdr_dist <- priority_mdr_draws %>%
+  dplyr::count(
+    collection,
+    year,
+    resistant_count,
+    name = "n"
+  ) %>%
+  tidyr::complete(
+    collection,
+    year,
+    resistant_count = 0:length(ab_list),
+    fill = list(n = 0)
+  ) %>%
+  dplyr::group_by(
+    collection,
+    year
+  ) %>%
+  dplyr::mutate(
+    freq = n / sum(n)
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    collection = factor(
+      collection,
+      levels = c(
+        "ESKAPE pathogens",
+        "WHO Bacterial Priority Pathogens List"
+      )
+    ),
+    resistant_count = factor(
+      resistant_count,
+      levels = 0:length(ab_list)
+    ),
+    year = as.integer(year)
+  )
+
+# ------------------------------------------------------------
+# Shared colour scale
+# ------------------------------------------------------------
+
+mdr_cols <- grDevices::colorRampPalette(
+  c("white", "#870101")
+)(length(ab_list) + 1)
+
+names(mdr_cols) <- as.character(0:length(ab_list))
+
+# ------------------------------------------------------------
+# Panel A: Global
+# ------------------------------------------------------------
+
+global_mdr_distribution_plot <- ggplot2::ggplot(
+  global_mdr_dist,
+  ggplot2::aes(
+    x = year,
+    y = freq,
+    fill = resistant_count
+  )
+) +
+  ggplot2::geom_col(
+    width = 1,
+    colour = NA
+  ) +
+  ggplot2::scale_fill_manual(
+    values = mdr_cols,
+    limits = as.character(0:length(ab_list)),
+    drop = FALSE,
+    name = "Resistance frequency",
+    guide = ggplot2::guide_legend(
+      nrow = 1,
+      byrow = TRUE,
+      keywidth = grid::unit(0.45, "cm"),
+      keyheight = grid::unit(0.35, "cm")
+    )
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks = seq(1990, 2023, 5),
+    expand = c(0, 0)
+  ) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.25),
+    expand = c(0, 0)
+  ) +
+  ggplot2::labs(
+    x = "\n",
+    y = "Distribution of resistance classes"
+  ) +
+  ggplot2::theme_classic(base_size = 9) +
+  ggplot2::theme(
+    panel.grid = ggplot2::element_blank(),
+    legend.position = "top",
+    legend.title = ggplot2::element_text(size = 8),
+    legend.text = ggplot2::element_text(size = 7),
+    legend.key = ggplot2::element_rect(
+      colour = "black",
+      linewidth = 0.2
+    )
+  )
+
+# ------------------------------------------------------------
+# Panel B: ESKAPE and WHO priority pathogens
+# ------------------------------------------------------------
+
+priority_pathogen_mdr_distribution_plot <- ggplot2::ggplot(
+  priority_mdr_dist,
+  ggplot2::aes(
+    x = year,
+    y = freq,
+    fill = resistant_count
+  )
+) +
+  ggplot2::geom_col(
+    width = 1,
+    colour = NA
+  ) +
+  ggplot2::facet_wrap(
+    ~ collection,
+    ncol = 1
+  ) +
+  ggplot2::scale_fill_manual(
+    values = mdr_cols,
+    limits = as.character(0:length(ab_list)),
+    drop = FALSE,
+    name = "Resistant classes",
+    guide = ggplot2::guide_legend(
+      nrow = 2,
+      byrow = TRUE,
+      keywidth = grid::unit(0.45, "cm"),
+      keyheight = grid::unit(0.35, "cm")
+    )
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks = seq(1990, 2023, 5),
+    expand = c(0, 0)
+  ) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.25),
+    expand = c(0, 0)
+  ) +
+  ggplot2::labs(
+    x = "",
+    y = "Distribution of resistance classes"
+  ) +
+  ggplot2::theme_classic(base_size = 9) +
+  ggplot2::theme(
+    strip.text = element_blank(),
+    strip.background = element_blank(),
+    panel.spacing.y = grid::unit(1.5, "cm"),
+    panel.grid = ggplot2::element_blank(),
+    legend.position = "none",
+    legend.title = ggplot2::element_text(size = 8),
+    legend.text = ggplot2::element_text(size = 7),
+    legend.key = ggplot2::element_rect(
+      colour = "black",
+      linewidth = 0.2
+    )
+  )
+
+global_mdr_distribution_plot
+priority_pathogen_mdr_distribution_plot
+
+```
+
+### 5.2 MDR thresholds
+
+Converts the MDR draws into threshold-based prevalence estimates for MDR and PDR in ESKAPE and WHO priority pathogens.
+
+```{r 5_2_mdr_thresholds, fig.width=7, fig.height=11}
+
+# ============================================================
+# Panels B and C: threshold prevalence for ESKAPE and WHO only
+# ============================================================
+
+threshold_summary <- species_mdr_draws %>%
+  dplyr::inner_join(
+    pathogen_collections,
+    by = "species"
+  ) %>%
+  dplyr::filter(
+    collection %in% c(
+      "ESKAPE pathogens",
+      "WHO Bacterial Priority Pathogens List"
+    )
+  ) %>%
+  dplyr::group_by(
+    collection,
+    year,
+    draw_id
+  ) %>%
+  dplyr::summarise(
+    mdr = mean(resistant_count >= 3, na.rm = TRUE),
+    pdr = mean(resistant_count >= 7, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    collection = factor(
+      collection,
+      levels = c(
+        "ESKAPE pathogens",
+        "WHO Bacterial Priority Pathogens List"
+      )
+    ),
+    year = as.integer(year)
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(mdr, pdr),
+    names_to = "metric",
+    values_to = "proportion"
+  ) %>%
+  dplyr::group_by(
+    collection,
+    metric,
+    year
+  ) %>%
+  dplyr::summarise(
+    q025 = stats::quantile(proportion, 0.025, na.rm = TRUE),
+    q10  = stats::quantile(proportion, 0.10,  na.rm = TRUE),
+    q25  = stats::quantile(proportion, 0.25,  na.rm = TRUE),
+    q50  = stats::quantile(proportion, 0.50,  na.rm = TRUE),
+    q75  = stats::quantile(proportion, 0.75,  na.rm = TRUE),
+    q90  = stats::quantile(proportion, 0.90,  na.rm = TRUE),
+    q975 = stats::quantile(proportion, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+priority_pathogen_mdr_prevalence_plot <- threshold_summary %>%
+  dplyr::filter(metric == "mdr") %>%
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = year,
+      y = q50
+    )
+  ) +
+  ggplot2::geom_ribbon(
+    ggplot2::aes(
+      ymin = q025,
+      ymax = q975
+    ),
+    alpha = 0.10
+  ) +
+  ggplot2::geom_ribbon(
+    ggplot2::aes(
+      ymin = q10,
+      ymax = q90
+    ),
+    alpha = 0.16
+  ) +
+  ggplot2::geom_ribbon(
+    ggplot2::aes(
+      ymin = q25,
+      ymax = q75
+    ),
+    alpha = 0.24
+  ) +
+  ggplot2::geom_line(
+    linewidth = 0.7
+  ) +
+  ggplot2::facet_wrap(
+    ~ collection,
+    ncol = 1
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks = seq(1990, 2023, 5),
+    expand = c(0, 0)
+  ) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.25),
+    labels = scales::label_percent(),
+    expand = c(0, 0)
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = "Proportion of isolates with multidrug resistance"
+  ) +
+  ggplot2::theme_classic(base_size = 9) +
+  ggplot2::theme(
+    strip.text = element_blank(),
+    strip.background = element_blank(),
+    panel.spacing.y = grid::unit(1.5, "cm"),
+    panel.grid = ggplot2::element_blank(),
+    legend.position = "none"
+  )
+
+priority_pathogen_pdr_prevalence_plot <- threshold_summary %>%
+  dplyr::filter(metric == "pdr") %>%
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = year,
+      y = q50
+    )
+  ) +
+  ggplot2::geom_ribbon(
+    ggplot2::aes(
+      ymin = q025,
+      ymax = q975
+    ),
+    alpha = 0.10
+  ) +
+  ggplot2::geom_ribbon(
+    ggplot2::aes(
+      ymin = q10,
+      ymax = q90
+    ),
+    alpha = 0.16
+  ) +
+  ggplot2::geom_ribbon(
+    ggplot2::aes(
+      ymin = q25,
+      ymax = q75
+    ),
+    alpha = 0.24
+  ) +
+  ggplot2::geom_line(
+    linewidth = 0.7
+  ) +
+  ggplot2::facet_wrap(
+    ~ collection,
+    ncol = 1
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks = seq(1990, 2023, 5),
+    expand = c(0, 0)
+  ) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.25),
+    labels = scales::label_percent(),
+    expand = c(0, 0)
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = "Proportion of isolates with pandrug resistance"
+  ) +
+  ggplot2::theme_classic(base_size = 9) +
+  ggplot2::theme(
+    strip.text = element_blank(),
+    strip.background = element_blank(),
+    panel.spacing.y = grid::unit(1.5, "cm"),
+    panel.grid = ggplot2::element_blank(),
+    legend.position = "none"
+  )
+
+multidrug_resistance_summary_panel <-
+  global_mdr_distribution_plot /
+  (
+    priority_pathogen_mdr_distribution_plot |
+    priority_pathogen_mdr_prevalence_plot |
+    priority_pathogen_pdr_prevalence_plot
+  ) +
+  plot_layout(
+    heights = c(0.6, 1)
+  ) &
+  theme(
+    plot.margin = margin(2, 2, 2, 2)
+  )
+
+multidrug_resistance_summary_panel
+
+ggplot2::ggsave(
+  filename = "outputs/multidrug_resistance_summary_panel.pdf",
+  plot = multidrug_resistance_summary_panel,
+  width = 20,
+  height = 20,
+  units = "cm",
+  dpi = 600,
+  device = cairo_pdf,
+  bg = "white"
+)
+
+```
+
+## 6 MDR collection partitioning
+
+### 6.1 Prepare data
+
+Builds the collection-specific subset and the metadata used to compare clinical syndrome and reservoir collections.
+
+```{r 6_1_prepare_data}
+
+species_category <- read.csv(
+  "data/species_category.csv",
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::mutate(
+    species = short_species_label(species)) %>%
+  dplyr::distinct()
+
+species_category <- species_category %>%
+  dplyr::select(-eskape, -who)
+
+category_cols <- names(species_category)[
+  !names(species_category) %in% "species" &
+    !grepl("_conf$", names(species_category))
+]
+
+species_collections <- purrr::map_dfr(
+  category_cols,
+  \(category) species_category %>%
+    dplyr::filter(
+      .data[[category]] == 2,
+      .data[[paste0(category, "_conf")]] == "High"
+    ) %>%
+    dplyr::transmute(
+      species,
+      collection = category
+    )
+)
+
+collection_mode_dist <- species_mdr_draws %>%
+  dplyr::inner_join(
+    species_collections,
+    by = "species"
+  ) %>%
+  dplyr::group_by(
+    collection,
+    year,
+    draw_id
+  ) %>%
+  dplyr::summarise(
+    modal_resistant_count = {
+      tab <- table(resistant_count)
+      max(as.integer(names(tab)[tab == max(tab)]))
+    },
+    .groups = "drop"
+  ) %>%
+  dplyr::count(
+    collection,
+    year,
+    modal_resistant_count,
+    name = "n"
+  ) %>%
+  tidyr::complete(
+    collection,
+    year,
+    modal_resistant_count = 0:length(ab_list),
+    fill = list(n = 0)
+  ) %>%
+  dplyr::group_by(collection, year) %>%
+  dplyr::mutate(freq = n / sum(n)) %>%
+  dplyr::ungroup()
+
+# ============================================================
+# Plotting metadata
+# ============================================================
+
+clinical_cols <- c(
+  "urogenital",
+  "enteric",
+  "skin_soft_tissue",
+  "respiratory",
+  "invasive_systemic"
+)
+
+reservoir_cols <- c(
+  "healthcare",
+  "environmental",
+  "foodborne",
+  "human_commensal",
+  "zoonotic",
+  "livestock"
+)
+
+collection_order <- c(clinical_cols, reservoir_cols)
+
+collection_labels <- c(
+  healthcare = "Healthcare",
+  urogenital = "Urogenital",
+  enteric = "Enteric",
+  skin_soft_tissue = "Skin / soft tissue",
+  respiratory = "Respiratory",
+  invasive_systemic = "Invasive / systemic",
+  environmental = "Environmental",
+  foodborne = "Foodborne",
+  human_commensal = "Human commensal",
+  zoonotic = "Zoonotic",
+  livestock = "Livestock"
+)
+
+collection_pattern_data <- collection_mode_dist %>%
+  dplyr::filter(collection %in% collection_order) %>%
+  dplyr::mutate(
+    collection_type = dplyr::if_else(
+      collection %in% clinical_cols,
+      "Clinical syndromes",
+      "Reservoirs"
+    ),
+    collection_type = factor(
+      collection_type,
+      levels = c("Clinical syndromes", "Reservoirs")
+    ),
+    collection_label = factor(
+      unname(collection_labels[collection]),
+      levels = unname(collection_labels[collection_order])
+    ),
+    modal_resistant_count = factor(
+      modal_resistant_count,
+      levels = 0:length(ab_list)
+    ),
+    year = as.integer(year)
+  )
+
+collection_mdr_cols <- colorRampPalette(c("white", "#870101"))(14)
+names(collection_mdr_cols) <- as.character(0:13)
+
+make_collection_plot <- function(dat, type_label) {
+  
+  ggplot(
+    dat,
+    aes(
+      x = year,
+      y = freq,
+      fill = modal_resistant_count
+    )
+  ) +
+    geom_col(width = 1, colour = NA) +
+    facet_wrap(~ collection_label, ncol = 1) +
+    scale_fill_manual(
+      values = collection_mdr_cols,
+      limits = as.character(0:13),
+      drop = FALSE,
+      name = "",
+      guide = guide_legend(
+        nrow = 2,
+        byrow = TRUE,
+        keywidth = unit(0.45, "cm"),
+        keyheight = unit(0.35, "cm")
+      )
+    ) +
+    scale_x_continuous(
+      breaks = seq(1990, 2023, 5),
+      expand = c(0, 0)
+    ) +
+    scale_y_continuous(
+      limits = c(0, 1),
+      breaks = seq(0, 1, 0.25),
+      expand = c(0, 0)
+    ) +
+    labs(
+      x = "",
+      y = "Distribution of resistance classes"
+    ) +
+    theme_classic(base_size = 9) +
+    theme(
+      strip.background = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "bottom"
+    )
+}
+```
+
+### 6.2 Clinical collection pattern
+
+Plots the resistance-class distribution for the clinical syndrome collections across time.
+
+```{r 6_2_clinical_collection_pattern, fig.width=7, fig.height=11}
+
+clinical_collection_pattern_plot <- collection_pattern_data %>%
+  filter(collection_type == "Clinical syndromes") %>%
+  make_collection_plot("Clinical syndromes")
+clinical_collection_pattern_plot
+
+ggsave(
+  filename = "outputs/clinical_collection_pattern_plot.pdf",
+  plot = clinical_collection_pattern_plot,
+  width = 9,
+  height = 20,
+  units = "cm",
+  dpi = 600,
+  device = cairo_pdf,
+  bg = "white"
+)
+
+```
+
+### 6.3 Reservoir collection pattern
+
+This chunk plots the resistance-class distribution for the reservoir collections across time.
+
+```{r 6_3_reservoir_collection_pattern, fig.width=7, fig.height=11}
+
+reservoir_collection_pattern_plot <- collection_pattern_data %>%
+  filter(collection_type == "Reservoirs") %>%
+  make_collection_plot("Reservoirs")
+reservoir_collection_pattern_plot
+
+ggsave(
+  filename = "outputs/reservoir_collection_pattern_plot.pdf",
+  plot = reservoir_collection_pattern_plot,
+  width = 9,
+  height = 23.4,
+  units = "cm",
+  dpi = 600,
+  device = cairo_pdf,
+  bg = "white"
+)
+
+```
